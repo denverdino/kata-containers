@@ -830,15 +830,13 @@ impl VmmService {
         vmm: &mut Vmm,
         blockdev_id: &str,
     ) -> VmmRequestResult {
-        let vm = vmm.get_vm_mut().ok_or(VmmActionError::HostDeviceConfig(
-            VfioDeviceError::InvalidVMID,
-        ))?;
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
 
         info!("prepare_remove_block_device: {blockdev_id:?}");
         let ctx = vm.create_device_op_context(None).map_err(|e| {
             info!("create device op context error: {e:?}");
             if let StartMicroVmError::MicroVMAlreadyRunning = e {
-                VmmActionError::HostDeviceConfig(VfioDeviceError::UpdateNotAllowedPostBoot)
+                VmmActionError::Block(BlockDeviceError::UpdateNotAllowedPostBoot)
             } else if let StartMicroVmError::UpcallServerNotReady = e {
                 VmmActionError::UpcallServerNotReady
             } else {

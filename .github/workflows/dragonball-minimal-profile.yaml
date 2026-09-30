@@ -1,0 +1,35 @@
+name: Dragonball minimal profile
+
+on:
+  push:
+    paths:
+      - 'src/dragonball/**'
+      - 'src/libs/**'
+      - 'Cargo.toml'
+      - '.github/workflows/dragonball-minimal-profile.yaml'
+  pull_request:
+    paths:
+      - 'src/dragonball/**'
+      - 'src/libs/**'
+      - 'Cargo.toml'
+      - '.github/workflows/dragonball-minimal-profile.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Prepare Rust and native build dependencies
+        run: |
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+      - name: Check independent consumer without hotplug or PCI
+        run: cargo check --manifest-path src/dragonball/tests/minimal-profile-consumer/Cargo.toml
+      - name: Check existing hotplug and PCI combination still compiles
+        run: >-
+          cargo check --manifest-path src/dragonball/tests/minimal-profile-consumer/Cargo.toml
+          --features dragonball/hotplug,dragonball/host-device,dragonball/dbs-upcall

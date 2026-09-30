@@ -392,7 +392,7 @@ impl NetworkDeviceMgr {
     /// Insert or update a network device into the manager.
     pub fn insert_device(
         &mut self,
-        mut ctx: DeviceOpContext,
+        ctx: DeviceOpContext,
         config: NetworkInterfaceConfig,
     ) -> std::result::Result<(), NetworkDeviceError> {
         // The id is the name the interface is given inside the guest, so an
@@ -433,9 +433,11 @@ impl NetworkDeviceMgr {
             "id" => config.id(),
         );
 
-        let device_index = self.info_list.insert_or_update(&config)?;
+        let _device_index = self.info_list.insert_or_update(&config)?;
 
+        #[cfg(feature = "hotplug")]
         if ctx.is_hotplug {
+            let mut ctx = ctx;
             slog::info!(
                 ctx.logger(),
                 "attach network device";
@@ -456,10 +458,10 @@ impl NetworkDeviceMgr {
                     ctx.insert_hotplug_mmio_device(&dev, None)
                         .map_err(NetworkDeviceError::DeviceManager)?;
                     // live-upgrade need save/restore device from info.device.
-                    self.info_list[device_index].set_device(dev);
+                    self.info_list[_device_index].set_device(dev);
                 }
                 Err(e) => {
-                    self.info_list.remove(device_index);
+                    self.info_list.remove(_device_index);
                     return Err(e);
                 }
             }

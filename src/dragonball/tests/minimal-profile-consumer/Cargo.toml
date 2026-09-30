@@ -1,0 +1,10 @@
+[package]
+name = "dragonball-minimal-profile-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+dragonball = { path = "../..", default-features = false, features = ["virtio-blk", "virtio-net"] }

@@ -25,6 +25,7 @@ use dbs_interrupt::UserspaceIoapicManager;
 use dbs_interrupt::{InterruptManager, KvmIrqManager};
 use dbs_legacy_devices::ConsoleHandler;
 #[cfg(feature = "dbs-virtio-devices")]
+#[cfg(feature = "host-device")]
 use dbs_pci::CAPABILITY_BAR_SIZE;
 use dbs_utils::epoll_manager::EpollManager;
 use kvm_ioctls::VmFd;
@@ -1286,7 +1287,7 @@ impl DeviceManager {
         ctx: &mut DeviceOpContext,
     ) -> std::result::Result<(), DeviceMgrError> {
         // unregister IoManager
-        Self::deregister_virtio_device(&device, ctx)?;
+        Self::deregister_mmio_virtio_device(&device, ctx)?;
 
         // unregister Resource manager
         let resources = device.get_assigned_resources();

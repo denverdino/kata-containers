@@ -20,14 +20,18 @@ use std::{
 };
 
 use dbs_device::DeviceIo;
+#[cfg(feature = "host-device")]
 use dbs_pci::VirtioPciDevice;
+#[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
 use dbs_upcall::{DevMgrResponse, UpcallClientResponse};
 use dbs_virtio_devices as virtio;
 use dbs_virtio_devices::block::{aio::Aio, io_uring::IoUring, Block, LocalFile, Ufile};
 #[cfg(feature = "vhost-user-blk")]
 use dbs_virtio_devices::vhost::vhost_user::block::VhostUserBlock;
 use serde_derive::{Deserialize, Serialize};
+#[cfg(feature = "host-device")]
 use virtio_queue::QueueSync;
+#[cfg(feature = "host-device")]
 use vm_memory::GuestRegionMmap;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
@@ -381,8 +385,13 @@ impl BlockDeviceMgr {
         config: BlockDeviceConfigInfo,
         sender: mpsc::Sender<Option<i32>>,
     ) -> std::result::Result<(), BlockDeviceError> {
-        if !cfg!(feature = "hotplug") && ctx.is_hotplug {
+        if !cfg!(all(feature = "hotplug", feature = "dbs-upcall")) && ctx.is_hotplug {
             return Err(BlockDeviceError::UpdateNotAllowedPostBoot);
+        }
+        if !cfg!(feature = "host-device") && config.use_pci_bus == Some(true) {
+            return Err(BlockDeviceError::DeviceManager(
+                DeviceMgrError::InvalidOperation,
+            ));
         }
 
         // If the id of the drive already exists in the list, the operation is update.
@@ -411,99 +420,122 @@ impl BlockDeviceMgr {
                     return Ok(());
                 }
 
-                let mut slot = 0;
+                #[cfg(not(all(feature = "hotplug", feature = "dbs-upcall")))]
+                {
+                    let _ = (&mut ctx, index, sender);
+                    Err(BlockDeviceError::UpdateNotAllowedPostBoot)
+                }
 
-                let use_generic_irq = config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ);
+                #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
+                {
+                    let mut slot = 0;
 
-                match config.device_type {
-                    BlockDeviceType::RawBlock => {
-                        let device = Self::create_blk_device(&config, &mut ctx)
-                            .map_err(BlockDeviceError::Virtio)?;
+                    let use_generic_irq = config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ);
 
-                        let dev = if let Some(true) = config.use_pci_bus {
-                            let pci_dev = DeviceManager::create_virtio_pci_device(
-                                device,
-                                &mut ctx,
-                                use_generic_irq,
-                            )
-                            .map_err(BlockDeviceError::DeviceManager)?;
+                    match config.device_type {
+                        BlockDeviceType::RawBlock => {
+                            let device = Self::create_blk_device(&config, &mut ctx)
+                                .map_err(BlockDeviceError::Virtio)?;
 
-                            let (_, devfn) = DeviceManager::get_pci_device_info(&pci_dev)?;
-                            slot = devfn >> 3;
+                            let dev = if let Some(true) = config.use_pci_bus {
+                                #[cfg(not(feature = "host-device"))]
+                                return Err(BlockDeviceError::DeviceManager(
+                                    DeviceMgrError::InvalidOperation,
+                                ));
+                                #[cfg(feature = "host-device")]
+                                {
+                                    let pci_dev = DeviceManager::create_virtio_pci_device(
+                                        device,
+                                        &mut ctx,
+                                        use_generic_irq,
+                                    )
+                                    .map_err(BlockDeviceError::DeviceManager)?;
 
-                            pci_dev
-                        } else {
-                            DeviceManager::create_mmio_virtio_device(
+                                    let (_, devfn) = DeviceManager::get_pci_device_info(&pci_dev)?;
+                                    slot = devfn >> 3;
+
+                                    pci_dev
+                                }
+                            } else {
+                                DeviceManager::create_mmio_virtio_device(
+                                    device,
+                                    &mut ctx,
+                                    config.use_shared_irq.unwrap_or(self.use_shared_irq),
+                                    use_generic_irq,
+                                )
+                                .map_err(BlockDeviceError::DeviceManager)?
+                            };
+
+                            let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                                Some(Box::new(move |_| {
+                                    // send the pci device slot to caller.
+                                    let _ = sender.send(Some(slot as i32));
+                                }));
+
+                            self.update_device_by_index(index, dev.clone())?;
+                            // live-upgrade need save/restore device from info.device.
+                            self.info_list[index].set_device(dev.clone());
+
+                            let mut cleanup = |e, ctx: DeviceOpContext| -> BlockDeviceError {
+                                let logger = ctx.logger().new(slog::o!());
+                                self.remove_device(ctx, &config.drive_id).unwrap();
+                                error!(
+                                    logger,
+                                    "failed to hot-add pci virtio block device {}, {:?}",
+                                    &config.drive_id,
+                                    e
+                                );
+                                BlockDeviceError::DeviceManager(e)
+                            };
+
+                            if let Some(true) = config.use_pci_bus {
+                                #[cfg(not(feature = "host-device"))]
+                                return Err(BlockDeviceError::DeviceManager(
+                                    DeviceMgrError::InvalidOperation,
+                                ));
+                                #[cfg(feature = "host-device")]
+                                {
+                                    let _ = ctx
+                                        .insert_hotplug_pci_device(&dev, callback)
+                                        .map_err(|e| cleanup(e, ctx))?;
+                                    Ok(())
+                                }
+                            } else {
+                                ctx.insert_hotplug_mmio_device(&dev, callback)
+                                    .map_err(|e| cleanup(e, ctx))
+                            }
+                        }
+                        #[cfg(feature = "vhost-user-blk")]
+                        BlockDeviceType::Spool | BlockDeviceType::Spdk => {
+                            let device = Self::create_vhost_user_device(&config, &mut ctx)
+                                .map_err(BlockDeviceError::Virtio)?;
+                            let dev = DeviceManager::create_mmio_virtio_device(
                                 device,
                                 &mut ctx,
                                 config.use_shared_irq.unwrap_or(self.use_shared_irq),
-                                use_generic_irq,
+                                config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ),
                             )
-                            .map_err(BlockDeviceError::DeviceManager)?
-                        };
+                            .map_err(BlockDeviceError::DeviceManager)?;
+                            let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                                Some(Box::new(move |_| {
+                                    let _ = sender.send(None);
+                                }));
 
-                        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
-                            Some(Box::new(move |_| {
-                                // send the pci device slot to caller.
-                                let _ = sender.send(Some(slot as i32));
-                            }));
-
-                        self.update_device_by_index(index, dev.clone())?;
-                        // live-upgrade need save/restore device from info.device.
-                        self.info_list[index].set_device(dev.clone());
-
-                        let mut cleanup = |e, ctx: DeviceOpContext| -> BlockDeviceError {
-                            let logger = ctx.logger().new(slog::o!());
-                            self.remove_device(ctx, &config.drive_id).unwrap();
-                            error!(
-                                logger,
-                                "failed to hot-add pci virtio block device {}, {:?}",
-                                &config.drive_id,
-                                e
-                            );
-                            BlockDeviceError::DeviceManager(e)
-                        };
-
-                        if let Some(true) = config.use_pci_bus {
-                            let _ = ctx
-                                .insert_hotplug_pci_device(&dev, callback)
-                                .map_err(|e| cleanup(e, ctx))?;
-                            Ok(())
-                        } else {
-                            ctx.insert_hotplug_mmio_device(&dev, callback)
-                                .map_err(|e| cleanup(e, ctx))
+                            self.update_device_by_index(index, Arc::clone(&dev))?;
+                            ctx.insert_hotplug_mmio_device(&dev, callback).map_err(|e| {
+                                let logger = ctx.logger().new(slog::o!());
+                                self.remove_device(ctx, &config.drive_id).unwrap();
+                                error!(
+                                    logger,
+                                    "failed to hot-add virtio block device {}, {:?}",
+                                    &config.drive_id,
+                                    e
+                                );
+                                BlockDeviceError::DeviceManager(e)
+                            })
                         }
+                        _ => Err(BlockDeviceError::InvalidBlockDeviceType),
                     }
-                    #[cfg(feature = "vhost-user-blk")]
-                    BlockDeviceType::Spool | BlockDeviceType::Spdk => {
-                        let device = Self::create_vhost_user_device(&config, &mut ctx)
-                            .map_err(BlockDeviceError::Virtio)?;
-                        let dev = DeviceManager::create_mmio_virtio_device(
-                            device,
-                            &mut ctx,
-                            config.use_shared_irq.unwrap_or(self.use_shared_irq),
-                            config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ),
-                        )
-                        .map_err(BlockDeviceError::DeviceManager)?;
-                        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
-                            Some(Box::new(move |_| {
-                                let _ = sender.send(None);
-                            }));
-
-                        self.update_device_by_index(index, Arc::clone(&dev))?;
-                        ctx.insert_hotplug_mmio_device(&dev, callback).map_err(|e| {
-                            let logger = ctx.logger().new(slog::o!());
-                            self.remove_device(ctx, &config.drive_id).unwrap();
-                            error!(
-                                logger,
-                                "failed to hot-add virtio block device {}, {:?}",
-                                &config.drive_id,
-                                e
-                            );
-                            BlockDeviceError::DeviceManager(e)
-                        })
-                    }
-                    _ => Err(BlockDeviceError::InvalidBlockDeviceType),
                 }
             }
         }
@@ -530,8 +562,15 @@ impl BlockDeviceMgr {
                         .map_err(BlockDeviceError::Virtio)?;
 
                     let device = if let Some(true) = info.config.use_pci_bus {
-                        DeviceManager::create_virtio_pci_device(device, ctx, use_generic_irq)
-                            .map_err(BlockDeviceError::RegisterBlockDevice)?
+                        #[cfg(not(feature = "host-device"))]
+                        return Err(BlockDeviceError::DeviceManager(
+                            DeviceMgrError::InvalidOperation,
+                        ));
+                        #[cfg(feature = "host-device")]
+                        {
+                            DeviceManager::create_virtio_pci_device(device, ctx, use_generic_irq)
+                                .map_err(BlockDeviceError::RegisterBlockDevice)?
+                        }
                     } else {
                         DeviceManager::create_mmio_virtio_device(
                             device,
@@ -600,53 +639,60 @@ impl BlockDeviceMgr {
         blockdev_id: &str,
         result_sender: Sender<Option<i32>>,
     ) -> Result<(), BlockDeviceError> {
-        if !cfg!(feature = "hotplug") {
-            return Err(BlockDeviceError::UpdateNotAllowedPostBoot);
+        #[cfg(not(all(feature = "hotplug", feature = "dbs-upcall")))]
+        {
+            let _ = (ctx, blockdev_id, result_sender);
+            Err(BlockDeviceError::UpdateNotAllowedPostBoot)
         }
+        #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
+        {
+            info!(ctx.logger(), "prepare remove block device");
 
-        info!(ctx.logger(), "prepare remove block device");
-
-        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
-            Some(Box::new(move |result| match result {
-                UpcallClientResponse::DevMgr(response) => {
-                    if let DevMgrResponse::Other(resp) = response {
-                        if let Err(e) = result_sender.send(Some(resp.result)) {
+            let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                Some(Box::new(move |result| match result {
+                    UpcallClientResponse::DevMgr(response) => {
+                        if let DevMgrResponse::Other(resp) = response {
+                            if let Err(e) = result_sender.send(Some(resp.result)) {
+                                log::error!("send upcall result failed, due to {e:?}!");
+                            }
+                        }
+                    }
+                    UpcallClientResponse::UpcallReset => {
+                        if let Err(e) = result_sender.send(None) {
                             log::error!("send upcall result failed, due to {e:?}!");
                         }
                     }
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        log::debug!("this arm should only be triggered under test");
+                    }
+                }));
+
+            let device_index = self
+                .get_index_of_drive_id(blockdev_id)
+                .ok_or(BlockDeviceError::InvalidDeviceId(blockdev_id.to_string()))?;
+
+            let info = &self.info_list[device_index];
+            if let Some(device) = info.device.as_ref() {
+                if let Some(_mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
+                    if callback.is_some() {
+                        ctx.remove_hotplug_mmio_device(device, callback)?;
+                    }
+                    return Ok(());
                 }
-                UpcallClientResponse::UpcallReset => {
-                    if let Err(e) = result_sender.send(None) {
-                        log::error!("send upcall result failed, due to {e:?}!");
+                #[cfg(feature = "host-device")]
+                if let Some(_pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
+                    GuestAddressSpaceImpl,
+                    QueueSync,
+                    GuestRegionMmap,
+                >>() {
+                    if callback.is_some() {
+                        ctx.remove_hotplug_pci_device(device, callback)?;
                     }
                 }
-                #[allow(unreachable_patterns)]
-                _ => {
-                    log::debug!("this arm should only be triggered under test");
-                }
-            }));
-
-        let device_index = self
-            .get_index_of_drive_id(blockdev_id)
-            .ok_or(BlockDeviceError::InvalidDeviceId(blockdev_id.to_string()))?;
-
-        let info = &self.info_list[device_index];
-        if let Some(device) = info.device.as_ref() {
-            if let Some(_mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
-                if callback.is_some() {
-                    ctx.remove_hotplug_mmio_device(device, callback)?;
-                }
-            } else if let Some(_pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
-                GuestAddressSpaceImpl,
-                QueueSync,
-                GuestRegionMmap,
-            >>() {
-                if callback.is_some() {
-                    ctx.remove_hotplug_pci_device(device, callback)?;
-                }
             }
+            Ok(())
         }
-        Ok(())
     }
 
     /// remove a block device, it basically is the inverse operation of `insert_device``
@@ -964,7 +1010,9 @@ impl BlockDeviceMgr {
                             .map(|_p| ())
                             .map_err(|_e| BlockDeviceError::BlockEpollHanderSendFail);
                     }
-                } else if let Some(pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
+                }
+                #[cfg(feature = "host-device")]
+                if let Some(pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
                     GuestAddressSpaceImpl,
                     QueueSync,
                     GuestRegionMmap,
