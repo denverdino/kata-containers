@@ -146,7 +146,7 @@ impl ConfigItem for MemDeviceInfo {
 #[derive(Clone)]
 pub struct MemDeviceMgr {
     /// A list of `MemDeviceConfig` objects.
-    info_list: DeviceConfigInfos<MemDeviceConfigInfo>,
+    pub(crate) info_list: DeviceConfigInfos<MemDeviceConfigInfo>,
     pub(crate) use_shared_irq: bool,
 }
 

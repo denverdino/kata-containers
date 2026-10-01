@@ -615,7 +615,7 @@ impl NetworkDeviceMgr {
         #[cfg(target_arch = "x86_64")]
         let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
 
-        let net_device = virtio::net::Net::new(
+        let mut net_device = virtio::net::Net::new(
             config.host_dev_name.clone(),
             cfg.guest_mac(),
             Arc::new(cfg.queue_sizes()),
@@ -625,6 +625,10 @@ impl NetworkDeviceMgr {
             f_access_platform,
         )
         .map_err(NetworkDeviceError::CreateNetDevice)?;
+
+        net_device
+            .set_capture_id(format!("net:{}", cfg.id()))
+            .map_err(NetworkDeviceError::CreateNetDevice)?;
 
         Ok(Box::new(net_device))
     }

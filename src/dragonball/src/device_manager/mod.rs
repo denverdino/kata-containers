@@ -674,6 +674,9 @@ pub struct DeviceManager {
     ))]
     pub(crate) net_manager: NetworkDeviceMgr,
 
+    #[cfg(all(feature = "virtio-blk", feature = "virtio-net"))]
+    capture_session: Option<capture::DeviceCaptureSession>,
+
     #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
     pub(crate) fs_manager: Arc<Mutex<FsDeviceMgr>>,
 
@@ -755,6 +758,8 @@ impl DeviceManager {
                 feature = "vhost-user-net"
             ))]
             net_manager: NetworkDeviceMgr::default(),
+            #[cfg(all(feature = "virtio-blk", feature = "virtio-net"))]
+            capture_session: None,
             #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
             fs_manager: Arc::new(Mutex::new(FsDeviceMgr::default())),
             #[cfg(feature = "virtio-mem")]
@@ -1644,6 +1649,9 @@ impl DeviceManager {
 #[cfg(feature = "dbs-virtio-devices")]
 pub mod persist;
 
+#[cfg(all(feature = "virtio-blk", feature = "virtio-net"))]
+pub mod capture;
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1732,6 +1740,8 @@ mod tests {
                     feature = "vhost-user-net"
                 ))]
                 net_manager: NetworkDeviceMgr::default(),
+                #[cfg(all(feature = "virtio-blk", feature = "virtio-net"))]
+                capture_session: None,
                 #[cfg(feature = "virtio-vsock")]
                 vsock_manager: VsockDeviceMgr::default(),
                 #[cfg(feature = "virtio-mem")]

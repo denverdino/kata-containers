@@ -124,7 +124,7 @@ impl ConfigItem for BalloonDeviceInfo {
 #[derive(Clone)]
 pub struct BalloonDeviceMgr {
     /// A list of `BalloonDeviceConfig` objects.
-    info_list: DeviceConfigInfos<BalloonDeviceConfigInfo>,
+    pub(crate) info_list: DeviceConfigInfos<BalloonDeviceConfigInfo>,
     pub(crate) use_shared_irq: bool,
 }
 

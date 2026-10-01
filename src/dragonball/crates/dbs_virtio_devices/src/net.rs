@@ -11,7 +11,8 @@ use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, TryLockError};
+use std::time::Instant;
 
 use dbs_device::resources::ResourceConstraint;
 use dbs_utils::epoll_manager::{
@@ -28,6 +29,7 @@ use virtio_queue::{QueueOwnedT, QueueSync, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryRegion, GuestRegionMmap};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::capture::{CaptureError, CaptureGate, CaptureGeneration, CaptureResult, WorkerAck};
 use crate::device::{VirtioDeviceConfig, VirtioDeviceInfo};
 use crate::{
     setup_config_space, vnet_hdr_len, ActivateError, ActivateResult, ConfigResult,
@@ -122,12 +124,162 @@ pub(crate) struct NetEpollHandler<
     patch_rate_limiter_fd: EventFd,
     receiver: Option<mpsc::Receiver<(BucketUpdate, BucketUpdate, BucketUpdate, BucketUpdate)>>,
     metrics: Arc<NetDeviceMetrics>,
+    capture: CaptureGate,
+    tap_suspended: bool,
+}
+
+// Capture and epoll callbacks own the same concrete handler lock. No callback can
+// still be writing guest memory when a successful hold acknowledgement is returned.
+struct NetSubscriber<T>(Arc<Mutex<T>>);
+
+impl<T: MutEventSubscriber> MutEventSubscriber for NetSubscriber<T> {
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
+        self.0
+            .lock()
+            .expect("net handler lock poisoned")
+            .process(events, ops);
+    }
+
+    fn init(&mut self, ops: &mut EventOps) {
+        self.0.lock().expect("net handler lock poisoned").init(ops);
+    }
+}
+
+trait NetCaptureController: Send {
+    fn request_hold(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck>;
+    fn resume_capture(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()>;
+}
+
+/// Cloneable control for an activated net handler, independent of its transport lock.
+#[derive(Clone)]
+pub struct NetCaptureControl(Arc<Mutex<dyn NetCaptureController>>);
+
+impl NetCaptureControl {
+    fn with_handler<T>(
+        &self,
+        deadline: Instant,
+        action: impl FnOnce(&mut dyn NetCaptureController) -> CaptureResult<T>,
+    ) -> CaptureResult<T> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(CaptureError::Timeout);
+            }
+            match self.0.try_lock() {
+                Ok(mut handler) => return action(&mut *handler),
+                Err(TryLockError::Poisoned(_)) => return Err(CaptureError::Disconnected),
+                Err(TryLockError::WouldBlock) => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Wait for any in-progress callback and freeze subsequent RX/TX writes.
+    pub fn request_hold(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        self.with_handler(deadline, |handler| {
+            handler.request_hold(generation, deadline)
+        })
+    }
+
+    /// Release the exact generation and kick the saved queues.
+    pub fn resume_capture(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()> {
+        self.with_handler(deadline, |handler| {
+            handler.resume_capture(generation, deadline)
+        })
+    }
+}
+
+impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion + Send + Sync>
+    NetCaptureController for NetEpollHandler<AS, Q, R>
+{
+    fn request_hold(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        NetEpollHandler::request_hold(self, generation, deadline)
+    }
+
+    fn resume_capture(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()> {
+        NetEpollHandler::resume_capture(self, generation, deadline)
+    }
 }
 
 impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> NetEpollHandler<AS, Q, R> {
+    fn request_hold(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        let (reply, receiver) = mpsc::channel();
+        self.capture.begin(generation, deadline, reply);
+        if self.capture.needs_ack() {
+            let result = if self.rx.deferred_irqs {
+                self.rx
+                    .queue
+                    .notify()
+                    .map_err(|e| CaptureError::ControlIo(e.to_string()))
+            } else {
+                Ok(())
+            };
+            self.rx.deferred_irqs = false;
+            self.rx.deferred_frame = false;
+            self.rx.bytes_read = 0;
+            let ack = self.capture.held_ack(false);
+            self.capture.finish_report(result.map(|()| ack));
+        }
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| CaptureError::Timeout)?
+    }
+
+    fn resume_capture(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()> {
+        if deadline <= Instant::now() {
+            return Err(CaptureError::Timeout);
+        }
+        if self.capture.release(generation)? {
+            self.rx
+                .queue
+                .eventfd
+                .write(1)
+                .map_err(|e| CaptureError::ControlIo(e.to_string()))?;
+            self.tx
+                .queue
+                .eventfd
+                .write(1)
+                .map_err(|e| CaptureError::ControlIo(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     // Attempts to copy a single frame into the guest if there is enough rate limiting budget.
     // Returns true on successful frame delivery.
     fn rate_limited_rx_single_frame(&mut self, mem: &AS::M) -> bool {
+        if self.capture.is_held() {
+            return false;
+        }
         // If limiter.consume() fails it means there is no more TokenType::Ops
         // budget and rate limiting is in effect.
         if !self.rx.rate_limiter.consume(1, TokenType::Ops) {
@@ -164,6 +316,9 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> NetEpollH
     // Returns true if a buffer was used, and false if the frame must be deferred until a buffer
     // is made available by the driver.
     fn rx_single_frame(&mut self, mem: &AS::M) -> bool {
+        if self.capture.is_held() {
+            return false;
+        }
         let mut next_desc;
         let mut desc_chain;
         let mut write_count = 0;
@@ -257,6 +412,9 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> NetEpollH
     }
 
     fn process_rx(&mut self, mem: &AS::M) -> Result<()> {
+        if self.capture.is_held() {
+            return Ok(());
+        }
         // Read as many frames as possible.
         loop {
             match self.read_from_tap() {
@@ -291,6 +449,9 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> NetEpollH
     }
 
     fn resume_rx(&mut self, mem: &AS::M) -> Result<()> {
+        if self.capture.is_held() {
+            return Ok(());
+        }
         if self.rx.deferred_frame {
             if self.rate_limited_rx_single_frame(mem) {
                 self.rx.deferred_frame = false;
@@ -309,6 +470,9 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> NetEpollH
     }
 
     fn process_tx(&mut self, mem: &AS::M) -> Result<()> {
+        if self.capture.is_held() {
+            return Ok(());
+        }
         let mut rate_limited = false;
         let mut used_count = 0;
         {
@@ -423,7 +587,39 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> NetEpollH
 impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> MutEventSubscriber
     for NetEpollHandler<AS, Q, R>
 {
-    fn process(&mut self, events: Events, _ops: &mut EventOps) {
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
+        if self.capture.is_held() && events.data() != PATCH_RATE_LIMITER_EVENT {
+            // Drain notifications, but preserve every unconsumed descriptor. A
+            // readable TAP must be removed to avoid spinning the shared loop.
+            match events.data() {
+                RX_TAP_EVENT if !self.tap_suspended => {
+                    match ops.remove(Events::with_data(&self.tap, RX_TAP_EVENT, EventSet::IN)) {
+                        Ok(()) => self.tap_suspended = true,
+                        Err(e) => error!("{}: failed to suspend TAP for capture: {:?}", self.id, e),
+                    }
+                }
+                RX_QUEUE_EVENT => {
+                    let _ = self.rx.queue.consume_event();
+                }
+                TX_QUEUE_EVENT => {
+                    let _ = self.tx.queue.consume_event();
+                }
+                RX_RATE_LIMITER_EVENT => {
+                    let _ = self.rx.rate_limiter.event_handler();
+                }
+                TX_RATE_LIMITER_EVENT => {
+                    let _ = self.tx.rate_limiter.event_handler();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.tap_suspended && !self.capture.is_held() {
+            match ops.add(Events::with_data(&self.tap, RX_TAP_EVENT, EventSet::IN)) {
+                Ok(()) => self.tap_suspended = false,
+                Err(e) => error!("{}: failed to restore TAP after capture: {:?}", self.id, e),
+            }
+        }
         let guard = self.config.lock_guest_memory();
         let mem = guard.deref();
         self.metrics.event_count.inc();
@@ -534,9 +730,13 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion> MutEventS
     fn init(&mut self, ops: &mut EventOps) {
         trace!(target: "virtio-net", "{}: NetEpollHandler::init()", self.id);
 
-        let events = Events::with_data(&self.tap, RX_TAP_EVENT, EventSet::IN);
-        if let Err(e) = ops.add(events) {
-            error!("{}: failed to register TAP RX event, {:?}", self.id, e);
+        if self.capture.is_held() {
+            self.tap_suspended = true;
+        } else {
+            let events = Events::with_data(&self.tap, RX_TAP_EVENT, EventSet::IN);
+            if let Err(e) = ops.add(events) {
+                error!("{}: failed to register TAP RX event, {:?}", self.id, e);
+            }
         }
 
         let events =
@@ -601,9 +801,48 @@ pub struct Net<AS: GuestAddressSpace> {
     patch_rate_limiter_fd: EventFd,
     sender: Option<mpsc::Sender<(BucketUpdate, BucketUpdate, BucketUpdate, BucketUpdate)>>,
     metrics: Arc<NetDeviceMetrics>,
+    capture_controller: Option<NetCaptureControl>,
+    capture_id: String,
 }
 
 impl<AS: GuestAddressSpace> Net<AS> {
+    /// Assign the machine's logical device ID before activation.
+    pub fn set_capture_id(&mut self, id: String) -> Result<()> {
+        if id.is_empty() || self.capture_controller.is_some() {
+            return Err(Error::InvalidInput);
+        }
+        self.capture_id = id;
+        Ok(())
+    }
+
+    /// Obtain control without retaining the MMIO device lock during capture.
+    pub fn capture_control(&self) -> CaptureResult<NetCaptureControl> {
+        if self.subscriber_id.is_none() {
+            return Err(CaptureError::Disconnected);
+        }
+        self.capture_controller
+            .clone()
+            .ok_or(CaptureError::Disconnected)
+    }
+
+    /// Freeze the activated RX/TX handler without waiting on its own event loop.
+    pub fn request_hold(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        self.capture_control()?.request_hold(generation, deadline)
+    }
+
+    /// Release the exact generation and kick queues preserved by capture.
+    pub fn resume_capture(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()> {
+        self.capture_control()?.resume_capture(generation, deadline)
+    }
+
     /// Create a new virtio network device with the given TAP interface.
     pub fn new_with_tap(
         tap: Tap,
@@ -662,6 +901,8 @@ impl<AS: GuestAddressSpace> Net<AS> {
             rx_rate_limiter,
             tx_rate_limiter,
             subscriber_id: None,
+            capture_controller: None,
+            capture_id: id.clone(),
             id,
             phantom: PhantomData,
             patch_rate_limiter_fd: EventFd::new(0).unwrap(),
@@ -811,7 +1052,7 @@ where
         let tx = TxVirtio::<Q>::new(tx_queue, self.tx_rate_limiter.take().unwrap_or_default());
         let patch_rate_limiter_fd = self.patch_rate_limiter_fd.try_clone().unwrap();
 
-        let handler = Box::new(NetEpollHandler {
+        let handler = Arc::new(Mutex::new(NetEpollHandler {
             tap,
             rx,
             tx,
@@ -820,9 +1061,15 @@ where
             patch_rate_limiter_fd,
             receiver: Some(receiver),
             metrics: self.metrics.clone(),
-        });
+            capture: CaptureGate::new(self.capture_id.clone()),
+            tap_suspended: false,
+        }));
 
-        self.subscriber_id = Some(self.device_info.register_event_handler(handler));
+        self.capture_controller = Some(NetCaptureControl(handler.clone()));
+        self.subscriber_id = Some(
+            self.device_info
+                .register_event_handler(Box::new(NetSubscriber(handler))),
+        );
         Ok(())
     }
 
@@ -849,6 +1096,7 @@ where
     }
 
     fn remove(&mut self) {
+        self.capture_controller = None;
         let subscriber_id = self.subscriber_id.take();
         if let Some(subscriber_id) = subscriber_id {
             match self.device_info.remove_event_handler(subscriber_id) {
@@ -917,11 +1165,195 @@ mod tests {
             rx,
             tx,
             config,
-            id,
+            id: id.clone(),
             patch_rate_limiter_fd: EventFd::new(0).unwrap(),
             receiver: None,
             metrics: Arc::new(NetDeviceMetrics::default()),
+            capture: CaptureGate::new(id),
+            tap_suspended: false,
         }
+    }
+
+    fn capture_net_fixture() -> NetEpollHandler<Arc<GuestMemoryMmap>> {
+        let mut handler = create_net_epoll_handler("capture-nic".to_string());
+        let mem = handler.config.vm_as.clone();
+        let rx = VirtQueue::new(GuestAddress(0), &mem, 16);
+        rx.dtable(0).set(0x2000, 64, VIRTQ_DESC_F_WRITE, 0);
+        rx.avail.ring(0).store(0);
+        rx.avail.idx().store(1);
+        handler.rx.queue = VirtioQueueConfig::new(
+            rx.create_queue(),
+            Arc::new(EventFd::new(0).unwrap()),
+            Arc::new(NoopNotifier::new()),
+            0,
+        );
+        let tx = VirtQueue::new(GuestAddress(0x400), &mem, 16);
+        tx.dtable(0).set(0x3000, 64, 0, 0);
+        tx.avail.ring(0).store(0);
+        tx.avail.idx().store(1);
+        handler.tx.queue = VirtioQueueConfig::new(
+            tx.create_queue(),
+            Arc::new(EventFd::new(0).unwrap()),
+            Arc::new(NoopNotifier::new()),
+            1,
+        );
+        mem.write_slice(&[0x55; 64], GuestAddress(0x2000)).unwrap();
+        mem.write_slice(&[0; 64], GuestAddress(0x3000)).unwrap();
+        handler.rx.frame_buf[..64].fill(0xe7);
+        handler.rx.bytes_read = 64;
+        handler
+    }
+
+    #[test]
+    fn capture_net_suspends_tap_and_restores_subscription() {
+        let handler = Arc::new(Mutex::new(capture_net_fixture()));
+        let control = NetCaptureControl(handler.clone());
+        let manager = EpollManager::default();
+        let id = manager.add_subscriber(Box::new(NetSubscriber(handler.clone())));
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        control
+            .request_hold(CaptureGeneration(1), deadline)
+            .unwrap();
+        {
+            let mut event_manager = manager.mgr.lock().unwrap();
+            let mut ops = event_manager.event_ops(id).unwrap();
+            let mut handler = handler.lock().unwrap();
+            let events = Events::with_data(&handler.tap, RX_TAP_EVENT, EventSet::IN);
+            handler.process(events, &mut ops);
+            assert!(handler.tap_suspended);
+            assert_eq!(
+                handler
+                    .config
+                    .vm_as
+                    .read_obj::<u16>(GuestAddress(0x12a))
+                    .unwrap(),
+                0
+            );
+        }
+        control
+            .resume_capture(CaptureGeneration(1), deadline)
+            .unwrap();
+        manager.handle_events(0).unwrap();
+        assert!(!handler.lock().unwrap().tap_suspended);
+    }
+
+    #[test]
+    fn capture_net_callback_lock_timeout_is_not_an_ack() {
+        let handler = Arc::new(Mutex::new(capture_net_fixture()));
+        let control = NetCaptureControl(handler.clone());
+        let guard = handler.lock().unwrap();
+        assert_eq!(
+            control.request_hold(
+                CaptureGeneration(1),
+                Instant::now() + std::time::Duration::from_millis(1)
+            ),
+            Err(CaptureError::Timeout)
+        );
+        assert!(!guard.capture.is_held());
+    }
+
+    #[test]
+    fn capture_net_activated_subscriber_holds_and_resumes_saved_tx() {
+        let handler = capture_net_fixture();
+        let mut config = handler.config;
+        let mem = config.vm_as.clone();
+        let tx_event = handler.tx.queue.eventfd.clone();
+        config.queues = vec![handler.rx.queue, handler.tx.queue];
+        let manager = EpollManager::default();
+        let mut net = Net::new_with_tap(
+            handler.tap,
+            None,
+            Arc::new(vec![16, 16]),
+            manager.clone(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        net.set_capture_id("net:eth0".to_string()).unwrap();
+        net.activate(config).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let ack = net.request_hold(CaptureGeneration(1), deadline).unwrap();
+        assert_eq!(ack.device_id, "net:eth0");
+        assert_eq!(ack.memory_writers, 0);
+        tx_event.write(1).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 0);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 0);
+        net.resume_capture(CaptureGeneration(1), deadline).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 1);
+    }
+
+    #[test]
+    fn capture_net_holds_rx_tx_memory_writes() {
+        let mut handler = capture_net_fixture();
+        let mem = handler.config.vm_as.clone();
+        let ack = handler
+            .request_hold(
+                crate::capture::CaptureGeneration(1),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(ack.device_id, "capture-nic");
+        assert_eq!(ack.generation, 1);
+        assert_eq!(ack.memory_writers, 0);
+        assert!(!ack.flush_completed);
+        // Another host frame can become readable while the guest remains held.
+        handler.rx.frame_buf[..64].fill(0xe7);
+        handler.rx.bytes_read = 64;
+        assert!(!handler.rx_single_frame(&mem));
+        handler.process_tx(&mem).unwrap();
+        let mut bytes = [0; 64];
+        mem.read_slice(&mut bytes, GuestAddress(0x2000)).unwrap();
+        assert_eq!(bytes, [0x55; 64]);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 0);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 0);
+    }
+
+    #[test]
+    fn capture_net_holds_tx_used_ring() {
+        let mut handler = capture_net_fixture();
+        let mem = handler.config.vm_as.clone();
+        handler
+            .request_hold(
+                crate::capture::CaptureGeneration(1),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        handler.process_tx(&mem).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 0);
+        handler
+            .resume_capture(
+                crate::capture::CaptureGeneration(1),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        handler.process_tx(&mem).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 1);
+    }
+
+    #[test]
+    fn capture_net_keeps_completed_ring_state() {
+        let mut handler = capture_net_fixture();
+        let mem = handler.config.vm_as.clone();
+        assert!(handler.rx_single_frame(&mem));
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 1);
+        assert!(handler.rx.deferred_irqs);
+        handler.rx.deferred_frame = true;
+        handler
+            .request_hold(
+                crate::capture::CaptureGeneration(1),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!handler.rx.deferred_irqs);
+        assert!(!handler.rx.deferred_frame);
+        assert_eq!(handler.rx.bytes_read, 0);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 1);
+        let mut bytes = [0; 64];
+        mem.read_slice(&mut bytes, GuestAddress(0x2000)).unwrap();
+        assert_eq!(bytes, [0xe7; 64]);
     }
 
     #[test]

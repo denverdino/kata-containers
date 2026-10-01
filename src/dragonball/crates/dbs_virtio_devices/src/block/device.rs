@@ -74,6 +74,7 @@ pub struct Block<AS: DbsGuestAddressSpace> {
     evt_senders: Vec<mpsc::Sender<KillEvent>>,
     epoll_threads: Vec<thread::JoinHandle<()>>,
     capture_controls: Vec<WorkerCaptureControl>,
+    capture_id: String,
     phantom: PhantomData<AS>,
 }
 
@@ -149,7 +150,26 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             kill_evts: Vec::with_capacity(num_queues),
             epoll_threads: Vec::with_capacity(num_queues),
             capture_controls: Vec::with_capacity(num_queues),
+            capture_id: BLK_DRIVER_NAME.to_string(),
         })
+    }
+
+    /// Assign the machine's logical device ID before activation.
+    pub fn set_capture_id(&mut self, id: String) -> Result<()> {
+        if id.is_empty() || !self.capture_controls.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        self.capture_id = id;
+        Ok(())
+    }
+
+    /// Obtain worker controls without retaining the MMIO device lock while waiting.
+    pub fn capture_controls(&self) -> CaptureResult<Vec<WorkerCaptureControl>> {
+        if self.capture_controls.is_empty() || self.capture_controls.len() != self.queue_sizes.len()
+        {
+            return Err(crate::capture::CaptureError::Disconnected);
+        }
+        Ok(self.capture_controls.clone())
     }
 
     /// Hold all queues without retaining a queue/device lock while waiting.
@@ -357,7 +377,7 @@ where
                 queue,
                 kill_evt: kill_evt.try_clone().unwrap(),
                 capture_receiver,
-                capture: CaptureGate::new(format!("virtio-blk/q{i}")),
+                capture: CaptureGate::new(format!("{}/q{i}", self.capture_id)),
             });
 
             kill_evts.push(kill_evt.try_clone().unwrap());
@@ -1846,6 +1866,72 @@ mod tests {
             ),
             Err(CaptureError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn capture_block_activated_queues_report_logical_ids() {
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let mut disks: Vec<Box<dyn Ufile>> = Vec::new();
+        for _ in 0..2 {
+            let file = file.try_clone().unwrap();
+            let aio = Aio::new(file.as_raw_fd(), 16).unwrap();
+            disks.push(Box::new(LocalFile::new(file, false, aio).unwrap()));
+        }
+        let manager = EpollManager::default();
+        let mut device = Block::new(
+            disks,
+            false,
+            false,
+            Arc::new(vec![16, 16]),
+            manager,
+            vec![],
+            false,
+        )
+        .unwrap();
+        device.set_capture_id("block:root".to_string()).unwrap();
+        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+        let queues = [0, 0x400]
+            .iter()
+            .enumerate()
+            .map(|(index, base)| {
+                let queue = VirtQueue::new(GuestAddress(*base), &mem, 16);
+                VirtioQueueConfig::new(
+                    queue.create_queue(),
+                    Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+                    Arc::new(NoopNotifier::new()),
+                    index as u16,
+                )
+            })
+            .collect();
+        let config = VirtioDeviceConfig::<Arc<GuestMemoryMmap>>::new(
+            mem,
+            create_address_space(),
+            Arc::new(Kvm::new().unwrap().create_vm().unwrap()),
+            DeviceResources::new(),
+            queues,
+            None,
+            Arc::new(NoopNotifier::new()),
+        );
+        device.activate(config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let report = device.request_hold(CaptureGeneration(1), deadline);
+        let resume = device.resume_capture(CaptureGeneration(1), deadline);
+        // Always join the actual activation workers before asserting reports.
+        VirtioDevice::<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap>::remove(&mut device);
+        let report = report.unwrap();
+        assert_eq!(
+            report
+                .iter()
+                .map(|ack| ack.device_id.as_str())
+                .collect::<Vec<_>>(),
+            ["block:root/q0", "block:root/q1"]
+        );
+        assert!(report.iter().all(|ack| ack.generation == 1
+            && ack.flush_completed
+            && ack.pending_io == 0
+            && ack.memory_writers == 0));
+        resume.unwrap();
     }
 
     #[test]

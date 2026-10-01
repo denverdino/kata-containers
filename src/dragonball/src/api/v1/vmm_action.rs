@@ -1885,6 +1885,7 @@ mod tests {
 
         let tests = &mut [
             // hotplug unready
+            #[cfg(feature = "hotplug")]
             TestData::new(
                 VmmAction::InsertNetworkDevice(named()),
                 InstanceState::Running,

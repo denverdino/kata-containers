@@ -141,6 +141,13 @@ where
         self.state.lock().unwrap()
     }
 
+    /// Try to acquire transport state without exceeding a capture deadline.
+    pub fn try_state(
+        &self,
+    ) -> std::sync::TryLockResult<MutexGuard<'_, MmioV2DeviceState<AS, Q, R>>> {
+        self.state.try_lock()
+    }
+
     /// Removes device.
     pub fn remove(&self) {
         self.state().get_inner_device_mut().remove();

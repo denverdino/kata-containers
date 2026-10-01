@@ -93,7 +93,7 @@ impl ConfigItem for RngDeviceInfo {
 #[derive(Clone)]
 pub struct RngDeviceMgr {
     /// A list of `RngDeviceConfig` objects.
-    info_list: DeviceConfigInfos<RngDeviceConfigInfo>,
+    pub(crate) info_list: DeviceConfigInfos<RngDeviceConfigInfo>,
 }
 
 impl RngDeviceMgr {
