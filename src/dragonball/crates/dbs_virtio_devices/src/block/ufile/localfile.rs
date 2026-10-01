@@ -72,6 +72,10 @@ impl<E> Seek for LocalFile<E> {
 }
 
 impl<E: IoEngine + Send> Ufile for LocalFile<E> {
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
     fn get_capacity(&self) -> u64 {
         self.capacity
     }

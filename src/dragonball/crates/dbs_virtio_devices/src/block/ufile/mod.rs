@@ -16,6 +16,15 @@ use super::request::IoDataDesc;
 
 /// Traits for the virtio-blk driver to access backend storage devices, such as localfile.
 pub trait Ufile: Read + Write + Seek + Send {
+    /// Synchronize the backing store after all captured I/O has completed.
+    /// Unknown backends must opt in; buffered Write::flush is not sufficient.
+    fn sync_all(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "capture sync is unsupported",
+        ))
+    }
+
     /// Get disk capacity in bytes.
     fn get_capacity(&self) -> u64;
 
