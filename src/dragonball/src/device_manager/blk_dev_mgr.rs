@@ -835,7 +835,7 @@ impl BlockDeviceMgr {
         #[cfg(target_arch = "x86_64")]
         let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
 
-        let mut block = Block::new(
+        let mut device = Block::new(
             block_files,
             cfg.is_read_only,
             cfg.sparse,
@@ -844,10 +844,11 @@ impl BlockDeviceMgr {
             limiters,
             f_access_platform,
         )?;
+        device.set_capture_id(format!("block:{}", cfg.drive_id))?;
         if let Some(serial) = &cfg.serial {
-            block.set_serial(serial)?;
+            device.set_serial(serial)?;
         }
-        Ok(Box::new(block))
+        Ok(Box::new(device))
     }
 
     #[cfg(feature = "vhost-user-blk")]

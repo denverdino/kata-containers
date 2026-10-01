@@ -178,18 +178,23 @@ impl CaptureGate {
     }
 
     pub(crate) fn finish(&mut self, flush: std::io::Result<()>) {
-        let generation = self
-            .generation
-            .expect("only held workers acknowledge capture");
         let result = flush
-            .map(|()| WorkerAck {
-                device_id: self.device_id.clone(),
-                generation: generation.0,
-                pending_io: 0,
-                memory_writers: 0,
-                flush_completed: true,
-            })
+            .map(|()| self.held_ack(true))
             .map_err(|e| CaptureError::FlushFailed(e.to_string()));
+        self.finish_report(result);
+    }
+
+    pub(crate) fn held_ack(&self, flush_completed: bool) -> WorkerAck {
+        WorkerAck {
+            device_id: self.device_id.clone(),
+            generation: self.generation.expect("ack requires a held worker").0,
+            pending_io: 0,
+            memory_writers: 0,
+            flush_completed,
+        }
+    }
+
+    pub(crate) fn finish_report(&mut self, result: CaptureResult<WorkerAck>) {
         for waiter in self.waiters.drain(..) {
             let _ = waiter.send(result.clone());
         }

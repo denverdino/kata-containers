@@ -226,7 +226,7 @@ pub type VfioDeviceInfo = DeviceConfigInfo<HostDeviceConfig>;
 /// A device manager to manage all VFIO devices.
 pub struct VfioDeviceMgr {
     vm_fd: Arc<VmFd>,
-    info_list: DeviceConfigInfos<HostDeviceConfig>,
+    pub(crate) info_list: DeviceConfigInfos<HostDeviceConfig>,
     locked_vm_size: u64,
     vfio_container: Option<Arc<VfioContainer>>,
     pci_system_manager: Arc<Mutex<PciSystemManager>>,
