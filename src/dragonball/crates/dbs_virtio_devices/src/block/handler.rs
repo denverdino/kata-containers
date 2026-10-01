@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
 
 use dbs_utils::{
     epoll_manager::{EventOps, Events, MutEventSubscriber},
@@ -20,6 +21,7 @@ use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, GuestRegionMmap};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::capture::{CaptureError, CaptureGate, WorkerCommand};
 use crate::{
     epoll_helper::{EpollHelper, EpollHelperError, EpollHelperHandler},
     DbsGuestAddressSpace, Error, Result, VirtioDeviceConfig, VirtioQueueConfig,
@@ -45,13 +47,24 @@ pub(crate) struct InnerBlockEpollHandler<AS: DbsGuestAddressSpace, Q: QueueT> {
     pub(crate) iovecs_vec: Vec<Vec<IoDataDesc>>,
     pub(crate) kill_evt: EventFd,
     pub(crate) evt_receiver: Receiver<KillEvent>,
+    pub(crate) capture_receiver: Receiver<WorkerCommand>,
+    pub(crate) capture: CaptureGate,
 
     pub(crate) vm_as: AS,
     pub(crate) queue: VirtioQueueConfig<Q>,
 }
 
 impl<AS: DbsGuestAddressSpace, Q: QueueT> InnerBlockEpollHandler<AS, Q> {
+    fn finish_capture_if_drained(&mut self) {
+        if self.capture.needs_ack() && self.pending_req_map.is_empty() {
+            self.capture.finish(self.disk_image.sync_all());
+        }
+    }
+
     pub(crate) fn process_queue(&mut self) -> bool {
+        if self.capture.is_held() {
+            return false;
+        }
         let as_mem = self.vm_as.memory();
         let mem = as_mem.deref();
         let mut queue = self.queue.queue_mut().lock();
@@ -401,6 +414,7 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT> EpollHelperHandler for InnerBlockEpoll
                 // io_complete() only returns permanent errors.
                 self.io_complete()
                     .expect("virtio-blk: failed to complete IO requests");
+                self.finish_capture_if_drained();
             }
             RATE_LIMITER_EVENT => {
                 // Upon rate limiter event, call the rate limiter handler
@@ -426,6 +440,39 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT> EpollHelperHandler for InnerBlockEpoll
                                 &bytes, &ops
                             );
                             self.get_patch_rate_limiters(bytes, ops);
+                        }
+                    }
+                }
+                while let Ok(command) = self.capture_receiver.try_recv() {
+                    match command {
+                        WorkerCommand::Hold {
+                            generation,
+                            deadline,
+                            reply,
+                        } => {
+                            self.capture.begin(generation, deadline, reply);
+                            self.finish_capture_if_drained();
+                        }
+                        WorkerCommand::Resume {
+                            generation,
+                            deadline,
+                            reply,
+                        } => {
+                            let result = if deadline <= Instant::now() {
+                                Err(CaptureError::Timeout)
+                            } else {
+                                self.capture.release(generation).map(|released| {
+                                    if released
+                                        && !self.rate_limiter.is_blocked()
+                                        && self.process_queue()
+                                    {
+                                        self.queue
+                                            .notify()
+                                            .expect("virtio-blk: failed to notify guest");
+                                    }
+                                })
+                            };
+                            let _ = reply.send(result);
                         }
                     }
                 }

@@ -25,6 +25,9 @@ use virtio_queue::QueueT;
 use vm_memory::GuestMemoryRegion;
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
+use crate::capture::{
+    CaptureGate, CaptureGeneration, CaptureResult, WorkerAck, WorkerCaptureControl,
+};
 use crate::{
     ActivateError, ActivateResult, ConfigResult, DbsGuestAddressSpace, Error, Result, VirtioDevice,
     VirtioDeviceConfig, VirtioDeviceInfo, TYPE_BLOCK,
@@ -70,6 +73,7 @@ pub struct Block<AS: DbsGuestAddressSpace> {
     kill_evts: Vec<EventFd>,
     evt_senders: Vec<mpsc::Sender<KillEvent>>,
     epoll_threads: Vec<thread::JoinHandle<()>>,
+    capture_controls: Vec<WorkerCaptureControl>,
     phantom: PhantomData<AS>,
 }
 
@@ -144,7 +148,40 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             evt_senders: Vec::with_capacity(num_queues),
             kill_evts: Vec::with_capacity(num_queues),
             epoll_threads: Vec::with_capacity(num_queues),
+            capture_controls: Vec::with_capacity(num_queues),
         })
+    }
+
+    /// Hold all queues without retaining a queue/device lock while waiting.
+    pub fn request_hold(
+        &self,
+        generation: CaptureGeneration,
+        deadline: std::time::Instant,
+    ) -> CaptureResult<Vec<WorkerAck>> {
+        if self.capture_controls.is_empty() || self.capture_controls.len() != self.queue_sizes.len()
+        {
+            return Err(crate::capture::CaptureError::Disconnected);
+        }
+        self.capture_controls
+            .iter()
+            .map(|worker| worker.request_hold(generation, deadline))
+            .collect()
+    }
+
+    /// Release every queue's barrier; the caller owns partial-failure recovery.
+    pub fn resume_capture(
+        &self,
+        generation: CaptureGeneration,
+        deadline: std::time::Instant,
+    ) -> CaptureResult<()> {
+        if self.capture_controls.is_empty() || self.capture_controls.len() != self.queue_sizes.len()
+        {
+            return Err(crate::capture::CaptureError::Disconnected);
+        }
+        for worker in &self.capture_controls {
+            worker.resume(generation, deadline)?;
+        }
+        Ok(())
     }
 
     fn build_config_space(disk_size: u64, max_size: u32, num_queues: u16, sparse: bool) -> Vec<u8> {
@@ -304,6 +341,9 @@ where
             self.evt_senders.push(evt_sender);
 
             let kill_evt = EventFd::new(EFD_NONBLOCK)?;
+            let (capture_control, capture_receiver) =
+                WorkerCaptureControl::new(kill_evt.try_clone()?);
+            self.capture_controls.push(capture_control);
 
             let mut handler = Box::new(InnerBlockEpollHandler {
                 rate_limiter,
@@ -316,6 +356,8 @@ where
                 vm_as: config.vm_as.clone(),
                 queue,
                 kill_evt: kill_evt.try_clone().unwrap(),
+                capture_receiver,
+                capture: CaptureGate::new(format!("virtio-blk/q{i}")),
             });
 
             kill_evts.push(kill_evt.try_clone().unwrap());
@@ -414,7 +456,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::io::{self, Read, Seek, SeekFrom, Write};
-    use std::os::unix::io::RawFd;
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::time::{Duration, Instant};
 
     use dbs_device::resources::DeviceResources;
     use dbs_interrupt::NoopNotifier;
@@ -424,13 +468,18 @@ mod tests {
     use virtio_queue::QueueSync;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, GuestRegionMmap};
     use vmm_sys_util::eventfd::EventFd;
+    use vmm_sys_util::tempfile::TempFile;
 
     use crate::epoll_helper::*;
     use crate::tests::{create_address_space, VirtQueue, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::{Error as VirtioError, VirtioQueueConfig};
 
     use super::*;
+    use crate::block::aio::Aio;
     use crate::block::*;
+    use crate::capture::{
+        CaptureError, CaptureGate, CaptureGeneration, WorkerCaptureControl, WorkerCommand,
+    };
 
     pub(super) struct DummyFile {
         pub(super) device_id: Option<String>,
@@ -478,6 +527,10 @@ mod tests {
     }
 
     impl Ufile for DummyFile {
+        fn sync_all(&mut self) -> io::Result<()> {
+            self.flush()
+        }
+
         fn get_capacity(&self) -> u64 {
             self.capacity
         }
@@ -1215,6 +1268,7 @@ mod tests {
         let iovecs_vec = vec![Vec::with_capacity(CONFIG_MAX_SEG as usize); 256];
 
         let (_, evt_receiver) = mpsc::channel();
+        let (_, capture_receiver) = mpsc::channel();
 
         InnerBlockEpollHandler {
             disk_image,
@@ -1226,6 +1280,8 @@ mod tests {
 
             kill_evt: EventFd::new(0).unwrap(),
             evt_receiver,
+            capture_receiver,
+            capture: CaptureGate::new("test-drive/q0".to_string()),
 
             vm_as: mem,
             queue,
@@ -1479,6 +1535,382 @@ mod tests {
             // test if rate limited
             assert!(handler.rate_limiter.is_blocked());
         }
+    }
+
+    fn capture_block_fixture() -> (
+        InnerBlockEpollHandler<Arc<GuestMemoryMmap>, QueueSync>,
+        WorkerCaptureControl,
+    ) {
+        let mut file = DummyFile::new();
+        file.capacity = 0x100000;
+        let mut handler = get_block_epoll_handler_with_file(file);
+        let (control, receiver) = WorkerCaptureControl::new(handler.kill_evt.try_clone().unwrap());
+        handler.capture_receiver = receiver;
+        handler.capture = CaptureGate::new("test-drive/q0".to_string());
+        let mem = handler.vm_as.clone();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        vq.dtable(0).set(0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable(1)
+            .set(0x2000, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
+        vq.dtable(2).set(0x3000, 1, VIRTQ_DESC_F_WRITE, 0);
+        mem.write_obj::<u32>(VIRTIO_BLK_T_IN, GuestAddress(0x1000))
+            .unwrap();
+        mem.write_obj::<u8>(0xff, GuestAddress(0x3000)).unwrap();
+        vq.avail.ring(0).store(0);
+        vq.avail.idx().store(1);
+        handler.queue = VirtioQueueConfig::new(
+            vq.create_queue(),
+            Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            Arc::new(NoopNotifier::new()),
+            0,
+        );
+        (handler, control)
+    }
+
+    fn capture_block_hold(
+        handler: &mut InnerBlockEpollHandler<Arc<GuestMemoryMmap>, QueueSync>,
+        control: &WorkerCaptureControl,
+        generation: u64,
+    ) -> mpsc::Receiver<crate::capture::CaptureResult<crate::capture::WorkerAck>> {
+        let (reply, receiver) = mpsc::channel();
+        control
+            .sender
+            .send(WorkerCommand::Hold {
+                generation: CaptureGeneration(generation),
+                deadline: Instant::now() + Duration::from_secs(1),
+                reply,
+            })
+            .unwrap();
+        control.wake.write(1).unwrap();
+        let mut helper = EpollHelper::new().unwrap();
+        assert!(!handler.handle_event(
+            &mut helper,
+            &epoll::Event::new(epoll::Events::EPOLLIN, KILL_EVENT as u64)
+        ));
+        receiver
+    }
+
+    #[test]
+    fn capture_block_preserves_unconsumed_descriptors() {
+        let (mut handler, control) = capture_block_fixture();
+        let ack = capture_block_hold(&mut handler, &control, 1)
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack.device_id, "test-drive/q0");
+        assert_eq!(ack.generation, 1);
+        assert_eq!(ack.pending_io, 0);
+        assert_eq!(ack.memory_writers, 0);
+        assert!(ack.flush_completed);
+        assert!(!handler.process_queue());
+        assert!(handler.pending_req_map.is_empty());
+        let mem = handler.vm_as.clone();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 0);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0xff);
+    }
+
+    #[test]
+    fn capture_block_drains_taken_requests_before_ack() {
+        let (mut handler, control) = capture_block_fixture();
+        assert!(!handler.process_queue());
+        assert_eq!(handler.pending_req_map.len(), 1);
+        let ack = capture_block_hold(&mut handler, &control, 1);
+        assert!(matches!(ack.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let mut file = DummyFile::new();
+        file.capacity = 0x100000;
+        file.have_complete_io = true;
+        handler.disk_image = Box::new(file);
+        let mut helper = EpollHelper::new().unwrap();
+        assert!(!handler.handle_event(
+            &mut helper,
+            &epoll::Event::new(epoll::Events::EPOLLIN, END_IO_EVENT as u64)
+        ));
+        let ack = ack.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(ack.pending_io, 0);
+        assert!(ack.flush_completed);
+        let mem = handler.vm_as.clone();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 1);
+        assert_ne!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0xff);
+    }
+
+    #[test]
+    fn capture_block_suppresses_queue_and_limiter_while_held() {
+        let (mut handler, control) = capture_block_fixture();
+        capture_block_hold(&mut handler, &control, 1)
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        handler.queue.eventfd.write(1).unwrap();
+        let mut helper = EpollHelper::new().unwrap();
+        for event in [QUEUE_AVAIL_EVENT, RATE_LIMITER_EVENT] {
+            assert!(!handler.handle_event(
+                &mut helper,
+                &epoll::Event::new(epoll::Events::EPOLLIN, event as u64)
+            ));
+            assert!(handler.pending_req_map.is_empty());
+            let mem = handler.vm_as.clone();
+            assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 0);
+            assert_eq!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0xff);
+        }
+    }
+
+    #[test]
+    fn capture_block_ready_limiter_does_not_consume_descriptors() {
+        let (mut handler, control) = capture_block_fixture();
+        handler.rate_limiter = RateLimiter::new(0, 0, 0, 1, 0, 1).unwrap();
+        assert!(handler.rate_limiter.consume(1, TokenType::Ops));
+        assert!(!handler.rate_limiter.consume(1, TokenType::Ops));
+        capture_block_hold(&mut handler, &control, 1)
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let mut event = libc::pollfd {
+            fd: handler.rate_limiter.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The pollfd is live for the syscall; a deadline bounds the test without sleeping.
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 1000) }, 1);
+        let mut helper = EpollHelper::new().unwrap();
+        assert!(!handler.handle_event(
+            &mut helper,
+            &epoll::Event::new(epoll::Events::EPOLLIN, RATE_LIMITER_EVENT as u64)
+        ));
+        assert!(!handler.rate_limiter.is_blocked());
+        assert!(handler.pending_req_map.is_empty());
+        assert_eq!(
+            handler.vm_as.read_obj::<u16>(GuestAddress(0x12a)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn capture_block_repeated_hold_and_wrong_generation() {
+        let (mut handler, control) = capture_block_fixture();
+        let first = capture_block_hold(&mut handler, &control, 1)
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            capture_block_hold(&mut handler, &control, 1)
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        for generation in [0, 2] {
+            assert!(matches!(
+                capture_block_hold(&mut handler, &control, generation)
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+                Err(CaptureError::StaleGeneration)
+            ));
+        }
+        assert!(!handler.process_queue());
+        assert!(handler.pending_req_map.is_empty());
+    }
+
+    struct CaptureBlockWorker {
+        kill: mpsc::Sender<KillEvent>,
+        wake: EventFd,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for CaptureBlockWorker {
+        fn drop(&mut self) {
+            let _ = self.kill.send(KillEvent::Kill);
+            let _ = self.wake.write(1);
+            if let Some(worker) = self.thread.take() {
+                let result = worker.join();
+                if !thread::panicking() {
+                    result.unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capture_block_real_aio_drains_and_resume_processes_saved_write() {
+        let (mut handler, control) = capture_block_fixture();
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let observer = file.try_clone().unwrap();
+        let aio = Aio::new(file.as_raw_fd(), 16).unwrap();
+        handler.disk_image = Box::new(LocalFile::new(file, false, aio).unwrap());
+        let mem = handler.vm_as.clone();
+        let queue_event = handler.queue.eventfd.clone();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        vq.dtable(0).set(0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable(1).set(0x2000, 512, VIRTQ_DESC_F_NEXT, 2);
+        vq.dtable(2).set(0x3000, 1, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring(0).store(0);
+        vq.avail.idx().store(1);
+        mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, GuestAddress(0x1000))
+            .unwrap();
+        mem.write_slice(&[0x5a; 512], GuestAddress(0x2000)).unwrap();
+        assert!(!handler.process_queue());
+        assert_eq!(handler.pending_req_map.len(), 1);
+        let (kill, receiver) = mpsc::channel();
+        handler.evt_receiver = receiver;
+        let wake = handler.kill_evt.try_clone().unwrap();
+        let worker = CaptureBlockWorker {
+            kill,
+            wake,
+            thread: Some(thread::spawn(move || handler.run().unwrap())),
+        };
+        let ack = control
+            .request_hold(
+                CaptureGeneration(1),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(ack.pending_io, 0);
+        assert!(ack.flush_completed);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 1);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x3000)).unwrap(), 0);
+        let mut bytes = [0; 512];
+        observer.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [0x5a; 512]);
+        mem.write_slice(&[0xa5; 512], GuestAddress(0x2000)).unwrap();
+        vq.avail.ring(1).store(0);
+        vq.avail.idx().store(2);
+        queue_event.write(1).unwrap();
+        assert_eq!(
+            control
+                .request_hold(
+                    CaptureGeneration(1),
+                    Instant::now() + Duration::from_secs(3)
+                )
+                .unwrap(),
+            ack
+        );
+        observer.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [0x5a; 512]);
+        control
+            .resume(
+                CaptureGeneration(1),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+        let second = control
+            .request_hold(
+                CaptureGeneration(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(second.pending_io, 0);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 2);
+        observer.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [0xa5; 512]);
+        drop(worker);
+        assert!(matches!(
+            control.resume(
+                CaptureGeneration(2),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(CaptureError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn capture_block_flush_failure_is_not_acknowledged() {
+        let (mut handler, control) = capture_block_fixture();
+        let mut file = DummyFile::new();
+        file.flush_error = true;
+        handler.disk_image = Box::new(file);
+        assert!(matches!(
+            capture_block_hold(&mut handler, &control, 1)
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Err(CaptureError::FlushFailed(_))
+        ));
+        assert!(!handler.process_queue());
+        assert!(handler.pending_req_map.is_empty());
+    }
+
+    #[test]
+    fn capture_block_ack_timeout_is_not_success() {
+        let (handler, control) = capture_block_fixture();
+        assert!(matches!(
+            control.request_hold(
+                CaptureGeneration(1),
+                Instant::now() + Duration::from_millis(5)
+            ),
+            Err(CaptureError::Timeout)
+        ));
+        drop(handler);
+        assert!(matches!(
+            control.request_hold(
+                CaptureGeneration(1),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(CaptureError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn capture_block_unactivated_device_cannot_ack_empty_worker_set() {
+        let mut file = DummyFile::new();
+        file.capacity = 0x100000;
+        let block = Block::<Arc<GuestMemoryMmap>>::new(
+            vec![Box::new(file)],
+            false,
+            false,
+            Arc::new(vec![]),
+            EpollManager::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            block.request_hold(
+                CaptureGeneration(1),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(CaptureError::Disconnected)
+        ));
+        assert!(matches!(
+            block.resume_capture(
+                CaptureGeneration(1),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(CaptureError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn capture_block_resume_kicks_saved_queue() {
+        let (mut handler, control) = capture_block_fixture();
+        capture_block_hold(&mut handler, &control, 1)
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let (reply, receiver) = mpsc::channel();
+        control
+            .sender
+            .send(WorkerCommand::Resume {
+                generation: CaptureGeneration(1),
+                deadline: Instant::now() + Duration::from_secs(1),
+                reply,
+            })
+            .unwrap();
+        control.wake.write(1).unwrap();
+        let mut helper = EpollHelper::new().unwrap();
+        assert!(!handler.handle_event(
+            &mut helper,
+            &epoll::Event::new(epoll::Events::EPOLLIN, KILL_EVENT as u64)
+        ));
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(handler.pending_req_map.len(), 1);
+        assert!(matches!(
+            capture_block_hold(&mut handler, &control, 1)
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Err(CaptureError::StaleGeneration)
+        ));
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub use self::device::*;
 mod notifier;
 pub use self::notifier::*;
 
+pub mod capture;
 pub mod persist;
 
 pub mod epoll_helper;
