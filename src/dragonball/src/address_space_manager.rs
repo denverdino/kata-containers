@@ -763,6 +763,45 @@ impl AddressSpaceMgr {
         self.base_to_slot.clone()
     }
 
+    /// Describe actual RAM mappings with packed offsets, excluding GPA holes.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    pub fn capture_layout(&self) -> Result<crate::snapshot::capture::MemoryLayout> {
+        use crate::snapshot::capture::{MemoryLayout, MemoryRegion};
+        let vm_as = self
+            .get_vm_as()
+            .ok_or(AddressManagerError::GuestMemoryNotInitialized)?;
+        let memory = vm_as.memory();
+        let slots = self
+            .base_to_slot
+            .lock()
+            .map_err(|_| AddressManagerError::InvalidOperation)?;
+        let mut total_bytes = 0u64;
+        let mut regions = Vec::new();
+        for region in memory.iter() {
+            let guest_addr = region.start_addr().raw_value();
+            let kvm_slot = *slots
+                .get(&guest_addr)
+                .ok_or(AddressManagerError::InvalidOperation)?;
+            regions.push(MemoryRegion {
+                guest_addr,
+                size: region.len(),
+                file_offset: total_bytes,
+                host_addr: region
+                    .get_host_address(MemoryRegionAddress(0))
+                    .map_err(|e| AddressManagerError::AccessGuestMemory(guest_addr, e))?
+                    as u64,
+                kvm_slot,
+            });
+            total_bytes = total_bytes
+                .checked_add(region.len())
+                .ok_or(AddressManagerError::InvalidOperation)?;
+        }
+        Ok(MemoryLayout {
+            regions,
+            total_bytes,
+        })
+    }
+
     /// get numa nodes infos from address space manager.
     pub fn get_numa_nodes(&self) -> &BTreeMap<u32, NumaNode> {
         &self.numa_nodes

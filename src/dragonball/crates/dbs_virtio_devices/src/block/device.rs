@@ -75,6 +75,7 @@ pub struct Block<AS: DbsGuestAddressSpace> {
     epoll_threads: Vec<thread::JoinHandle<()>>,
     capture_controls: Vec<WorkerCaptureControl>,
     capture_id: String,
+    capture_on_activate: Option<CaptureGeneration>,
     phantom: PhantomData<AS>,
 }
 
@@ -151,7 +152,20 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             epoll_threads: Vec::with_capacity(num_queues),
             capture_controls: Vec::with_capacity(num_queues),
             capture_id: BLK_DRIVER_NAME.to_string(),
+            capture_on_activate: None,
         })
+    }
+
+    /// Arm capture before starting any independent I/O worker.
+    pub fn arm_capture(&mut self, generation: CaptureGeneration) -> CaptureResult<()> {
+        if generation.0 == 0
+            || !self.capture_controls.is_empty()
+            || self.capture_on_activate.is_some()
+        {
+            return Err(crate::capture::CaptureError::StaleGeneration);
+        }
+        self.capture_on_activate = Some(generation);
+        Ok(())
     }
 
     /// Assign the machine's logical device ID before activation.
@@ -377,7 +391,10 @@ where
                 queue,
                 kill_evt: kill_evt.try_clone().unwrap(),
                 capture_receiver,
-                capture: CaptureGate::new(format!("{}/q{i}", self.capture_id)),
+                capture: CaptureGate::armed(
+                    format!("{}/q{i}", self.capture_id),
+                    self.capture_on_activate,
+                ),
             });
 
             kill_evts.push(kill_evt.try_clone().unwrap());
@@ -1962,6 +1979,72 @@ mod tests {
             ),
             Err(CaptureError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn load_held_block_is_gated_before_worker_start() {
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let observer = file.try_clone().unwrap();
+        let aio = Aio::new(file.as_raw_fd(), 16).unwrap();
+        let mut device = Block::new(
+            vec![Box::new(LocalFile::new(file, false, aio).unwrap())],
+            false,
+            false,
+            Arc::new(vec![16]),
+            EpollManager::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        vq.dtable(0).set(0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable(1).set(0x2000, 512, VIRTQ_DESC_F_NEXT, 2);
+        vq.dtable(2).set(0x3000, 1, VIRTQ_DESC_F_WRITE, 0);
+        mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, GuestAddress(0x1000))
+            .unwrap();
+        mem.write_slice(&[0x5a; 512], GuestAddress(0x2000)).unwrap();
+        vq.avail.ring(0).store(0);
+        vq.avail.idx().store(1);
+        let event = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let config = VirtioDeviceConfig::<Arc<GuestMemoryMmap>>::new(
+            mem.clone(),
+            create_address_space(),
+            Arc::new(Kvm::new().unwrap().create_vm().unwrap()),
+            DeviceResources::new(),
+            vec![VirtioQueueConfig::new(
+                vq.create_queue(),
+                event.clone(),
+                Arc::new(NoopNotifier::new()),
+                0,
+            )],
+            None,
+            Arc::new(NoopNotifier::new()),
+        );
+        device.arm_capture(CaptureGeneration(7)).unwrap();
+        device.activate(config).unwrap();
+        event.write(1).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let held = mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap();
+        let mut held_disk = [0; 512];
+        observer.read_exact_at(&mut held_disk, 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        device.request_hold(CaptureGeneration(7), deadline).unwrap();
+        device
+            .resume_capture(CaptureGeneration(7), deadline)
+            .unwrap();
+        while mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let used = mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap();
+        VirtioDevice::<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap>::remove(&mut device);
+        let mut resumed_disk = [0; 512];
+        observer.read_exact_at(&mut resumed_disk, 0).unwrap();
+        assert_eq!(held, 0);
+        assert_eq!(held_disk, [0; 512]);
+        assert_eq!(used, 1);
+        assert_eq!(resumed_disk, [0x5a; 512]);
     }
 
     #[test]

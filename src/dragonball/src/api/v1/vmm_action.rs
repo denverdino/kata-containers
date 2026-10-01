@@ -60,6 +60,10 @@ use super::*;
 /// Wrapper for all errors associated with VMM actions.
 #[derive(Debug, thiserror::Error)]
 pub enum VmmActionError {
+    /// A held capture action was rejected or lost its consistency proof.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    #[error("held capture failed: {0}")]
+    Capture(#[source] crate::snapshot::capture::CaptureError),
     /// Invalid virtual machine instance ID.
     #[error("the virtual machine instance ID is invalid")]
     InvalidVMID,
@@ -176,6 +180,44 @@ pub enum VmmActionError {
 /// bits of information (ids, paths, etc.).
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmmAction {
+    /// Confirm CPU and complete device holds for a new generation.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    BeginCapture {
+        /// Nonzero monotonic session generation.
+        generation: u64,
+        /// Common transition deadline.
+        deadline: std::time::Instant,
+    },
+    /// Release the original generation; optionally let guest CPUs run.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    EndCapture {
+        /// Current held generation.
+        generation: u64,
+        /// Common transition deadline.
+        deadline: std::time::Instant,
+        /// Explicit permission to enter KVM_RUN.
+        resume: bool,
+    },
+    /// Restore without allowing vCPU execution or device queue consumption.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    LoadSnapshotHeld {
+        /// Target held generation.
+        generation: u64,
+        /// Common transition deadline.
+        deadline: std::time::Instant,
+        /// Owned input handles; no pathname is reopened.
+        files: crate::snapshot::capture::SnapshotFiles,
+    },
+    /// Write metadata and full packed RAM from the same confirmed generation.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    ExportHeldSnapshot {
+        /// Current held generation.
+        generation: u64,
+        /// Operation deadline; failure keeps the session held.
+        deadline: std::time::Instant,
+        /// Owned output handles; no pathname is reopened.
+        files: crate::snapshot::capture::SnapshotFiles,
+    },
     /// Configure the boot source of the microVM using `BootSourceConfig`.
     /// This action can only be called before the microVM has booted.
     ConfigureBootSource(BootSourceConfig),
@@ -325,6 +367,9 @@ pub enum VmmAction {
 /// empty, when no data needs to be sent, or an internal VMM structure.
 #[derive(Debug)]
 pub enum VmmData {
+    /// Complete current-generation CPU/device and memory mapping proof.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    CaptureReport(crate::snapshot::capture::CaptureReport),
     /// No data is sent on the channel.
     Empty,
     /// The microVM configuration represented by `VmConfigInfo`.
@@ -382,7 +427,80 @@ impl VmmService {
         };
         debug!("receive vmm action: {request:?}");
 
+        #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+        if vmm.get_vm_mut().is_some_and(|vm| vm.capture_is_active())
+            && !matches!(
+                request,
+                VmmAction::BeginCapture { .. }
+                    | VmmAction::EndCapture { .. }
+                    | VmmAction::ExportHeldSnapshot { .. }
+                    | VmmAction::LoadSnapshotHeld { .. }
+                    | VmmAction::ShutdownMicroVm
+                    | VmmAction::GetVmConfiguration
+                    | VmmAction::GetHypervisorMetrics
+            )
+        {
+            return self.send_response(Err(VmmActionError::Capture(
+                crate::snapshot::capture::CaptureError::Rejected(
+                    "capture session owns this VM".into(),
+                ),
+            )));
+        }
+
         let response = match request {
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::BeginCapture {
+                generation,
+                deadline,
+            } => vmm
+                .get_vm_mut()
+                .ok_or(VmmActionError::InvalidVMID)
+                .and_then(|vm| {
+                    vm.begin_capture(generation, deadline)
+                        .map(VmmData::CaptureReport)
+                        .map_err(VmmActionError::Capture)
+                }),
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::EndCapture {
+                generation,
+                deadline,
+                resume,
+            } => vmm
+                .get_vm_mut()
+                .ok_or(VmmActionError::InvalidVMID)
+                .and_then(|vm| {
+                    vm.end_capture(generation, deadline, resume)
+                        .map(|_| VmmData::Empty)
+                        .map_err(VmmActionError::Capture)
+                }),
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::ExportHeldSnapshot {
+                generation,
+                deadline,
+                files,
+            } => vmm
+                .get_vm_mut()
+                .ok_or(VmmActionError::InvalidVMID)
+                .and_then(|vm| {
+                    vm.export_held_snapshot(generation, deadline, &files)
+                        .map(|_| VmmData::Empty)
+                        .map_err(VmmActionError::Capture)
+                }),
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::LoadSnapshotHeld {
+                generation,
+                deadline,
+                files,
+            } => {
+                let filters = vmm.seccomp_filters();
+                vmm.get_vm_mut()
+                    .ok_or(VmmActionError::InvalidVMID)
+                    .and_then(|vm| {
+                        vm.load_snapshot_held(event_mgr, filters, &files, generation, deadline)
+                            .map(VmmData::CaptureReport)
+                            .map_err(VmmActionError::Capture)
+                    })
+            }
             VmmAction::ConfigureBootSource(boot_source_body) => {
                 self.configure_boot_source(vmm, boot_source_body)
             }

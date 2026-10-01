@@ -115,3 +115,29 @@ where
     }
     mmio_dev.restore_state(transport)
 }
+
+/// Install the held gate while a fresh device is still unactivated.
+#[cfg(all(feature = "virtio-blk", feature = "virtio-net"))]
+pub(crate) fn arm_device_capture(
+    device: &Arc<dyn DeviceIo>,
+    generation: dbs_virtio_devices::capture::CaptureGeneration,
+) -> std::result::Result<(), VirtioError> {
+    use crate::address_space_manager::GuestAddressSpaceImpl;
+    use dbs_virtio_devices::{block::Block, net::Net};
+    let transport = device
+        .as_any()
+        .downcast_ref::<DbsMmioV2Device>()
+        .ok_or(VirtioError::InvalidInput)?;
+    let mut state = transport
+        .try_state()
+        .map_err(|_| VirtioError::InvalidInput)?;
+    let inner = state.get_inner_device_mut().as_any_mut();
+    let result = if let Some(block) = inner.downcast_mut::<Block<GuestAddressSpaceImpl>>() {
+        block.arm_capture(generation)
+    } else if let Some(net) = inner.downcast_mut::<Net<GuestAddressSpaceImpl>>() {
+        net.arm_capture(generation)
+    } else {
+        return Err(VirtioError::InvalidInput);
+    };
+    result.map_err(|_| VirtioError::InvalidInput)
+}

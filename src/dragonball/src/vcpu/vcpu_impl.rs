@@ -229,6 +229,16 @@ pub enum VcpuEvent {
     /// indices of the MSRs to save.
     #[cfg(target_arch = "x86_64")]
     SaveState(Vec<u32>),
+
+    /// Dedicated capture reply, independent of stale legacy pause responses.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    CapturePause(u64, Sender<crate::snapshot::capture::VcpuAck>),
+    /// Confirm an explicit capture release before reporting the VM running.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    CaptureResume(u64, Sender<crate::snapshot::capture::VcpuAck>),
+    /// Save using a dedicated channel bounded by the operation's common deadline.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    CaptureSave(Vec<u32>, Sender<Result<crate::vcpu::VcpuState>>),
 }
 
 /// List of responses that the Vcpu reports.
@@ -274,6 +284,16 @@ pub struct VcpuHandle {
 }
 
 impl VcpuHandle {
+    /// Capture must return a disconnected error rather than panic during teardown.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    pub(crate) fn send_capture_event(&self, event: VcpuEvent) -> Result<()> {
+        self.event_sender
+            .send(event)
+            .map_err(|_| VcpuError::Kvm(kvm_ioctls::Error::new(libc::EPIPE)))?;
+        self.vcpu_thread
+            .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
+            .map_err(VcpuError::SignalVcpu)
+    }
     /// Send event to vCPU thread
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
         // Use expect() to crash if the other thread closed this channel.
@@ -486,7 +506,11 @@ impl Vcpu {
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
     fn run_emulation(&mut self) -> Result<VcpuEmulation> {
-        match Vcpu::emulate(&mut self.fd) {
+        #[cfg(not(test))]
+        let emulation = Vcpu::emulate(&mut self.fd);
+        #[cfg(test)]
+        let emulation = tests::emulate_vm(&self.vm_fd, &mut self.fd);
+        match emulation {
             Ok(run) => {
                 match run {
                     #[cfg(target_arch = "x86_64")]
@@ -712,6 +736,25 @@ impl Vcpu {
 
         // Break this emulation loop on any transition request/external event.
         match self.event_receiver.try_recv() {
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            Ok(VcpuEvent::CapturePause(generation, reply)) => {
+                let _ = reply.send(crate::snapshot::capture::VcpuAck {
+                    vcpu_id: self.id,
+                    generation,
+                });
+                state = StateMachine::next(Self::paused);
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            Ok(VcpuEvent::CaptureResume(generation, reply)) => {
+                let _ = reply.send(crate::snapshot::capture::VcpuAck {
+                    vcpu_id: self.id,
+                    generation,
+                });
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            Ok(VcpuEvent::CaptureSave(_, reply)) => {
+                let _ = reply.send(Err(VcpuError::Kvm(kvm_ioctls::Error::new(libc::EBUSY))));
+            }
             // Running ---- Exit ----> Exited
             Ok(VcpuEvent::Exit) => {
                 // Move to 'exited' state.
@@ -773,6 +816,27 @@ impl Vcpu {
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            Ok(VcpuEvent::CapturePause(generation, reply)) => {
+                let _ = reply.send(crate::snapshot::capture::VcpuAck {
+                    vcpu_id: self.id,
+                    generation,
+                });
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            Ok(VcpuEvent::CaptureResume(generation, reply)) => {
+                let _ = reply.send(crate::snapshot::capture::VcpuAck {
+                    vcpu_id: self.id,
+                    generation,
+                });
+                StateMachine::next(Self::running)
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            Ok(VcpuEvent::CaptureSave(msrs, reply)) => {
+                let _ = reply.send(dbs_snapshot::Persist::save_state(self, &msrs));
+                StateMachine::next(Self::paused)
+            }
             // Paused ---- Exit ----> Exited
             Ok(VcpuEvent::Exit) => {
                 // Move to 'exited' state.
@@ -884,6 +948,7 @@ impl Drop for Vcpu {
 
 #[cfg(test)]
 pub mod tests {
+    use std::os::unix::io::AsRawFd;
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::Mutex;
 
@@ -914,6 +979,52 @@ pub mod tests {
 
     lazy_static! {
         pub static ref EMULATE_RES: Mutex<EmulationCase> = Mutex::new(EmulationCase::Unknown);
+        static ref REAL_VM_FDS: Mutex<std::collections::HashMap<i32, usize>> =
+            Mutex::new(std::collections::HashMap::new());
+    }
+
+    // RAII ownership prevents raw-FD reuse while a real-execution fixture is registered.
+    pub(crate) struct RealVcpuExecution(Arc<VmFd>);
+
+    impl RealVcpuExecution {
+        pub(crate) fn new(vm: Arc<VmFd>) -> Self {
+            REAL_VM_FDS.lock().unwrap().insert(vm.as_raw_fd(), 0);
+            Self(vm)
+        }
+
+        pub(crate) fn run_count(&self) -> usize {
+            *REAL_VM_FDS
+                .lock()
+                .unwrap()
+                .get(&self.0.as_raw_fd())
+                .unwrap()
+        }
+    }
+
+    impl Drop for RealVcpuExecution {
+        fn drop(&mut self) {
+            REAL_VM_FDS.lock().unwrap().remove(&self.0.as_raw_fd());
+        }
+    }
+
+    pub(super) fn emulate_vm<'a>(
+        vm: &VmFd,
+        fd: &'a mut VcpuFd,
+    ) -> std::result::Result<VcpuExit<'a>, kvm_ioctls::Error> {
+        let real = {
+            let mut registered = REAL_VM_FDS.lock().unwrap();
+            if let Some(count) = registered.get_mut(&vm.as_raw_fd()) {
+                *count += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if real {
+            fd.run()
+        } else {
+            Vcpu::emulate(fd)
+        }
     }
 
     impl Vcpu {

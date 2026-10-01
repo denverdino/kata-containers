@@ -7,6 +7,14 @@ mod sm;
 mod vcpu_impl;
 mod vcpu_manager;
 
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    feature = "virtio-blk",
+    feature = "virtio-net"
+))]
+pub(crate) use vcpu_impl::tests::RealVcpuExecution;
+
 use dbs_arch::VpmuFeatureLevel;
 pub use vcpu_impl::VcpuState;
 pub use vcpu_manager::{VcpuManager, VcpuManagerError, VcpuResizeInfo};

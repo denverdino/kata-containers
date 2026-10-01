@@ -4,6 +4,9 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Deref;
+
+#[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+mod capture;
 #[cfg(target_arch = "x86_64")]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
@@ -202,6 +205,12 @@ pub struct Vm {
     reset_eventfd: Option<EventFd>,
     resource_manager: Arc<ResourceManager>,
     vcpu_manager: Option<Arc<Mutex<VcpuManager>>>,
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    capture_session: Option<capture::VmCaptureSession>,
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    last_capture_generation: u64,
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    capture_source: Option<crate::snapshot::capture::SnapshotFiles>,
     vm_config: VmConfigInfo,
     vm_fd: Arc<VmFd>,
 
@@ -288,6 +297,12 @@ impl Vm {
             reset_eventfd: None,
             resource_manager,
             vcpu_manager: None,
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            capture_session: None,
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            last_capture_generation: 0,
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            capture_source: None,
             vm_config: Default::default(),
             vm_fd,
 
@@ -520,6 +535,10 @@ impl Vm {
 
     /// Resume all vcpus and calc the intance downtime
     pub fn resume_all_vcpus_with_downtime(&mut self) -> std::result::Result<(), VcpuManagerError> {
+        #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+        if self.capture_session.is_some() {
+            return Err(VcpuManagerError::UnexpectedVcpuResponse);
+        }
         self.vcpu_manager()?.resume_all_vcpus()?;
         self.shared_info
             .write()
@@ -1128,6 +1147,13 @@ impl Vm {
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
         use crate::snapshot::SnapshotError;
 
+        #[cfg(all(feature = "virtio-blk", feature = "virtio-net"))]
+        if self.capture_session.is_some() {
+            return Err(SnapshotError::InvalidState(
+                "capture session owns this VM".into(),
+            ));
+        }
+
         let msr_list = self.kvm.supported_msrs(0).map_err(SnapshotError::Kvm)?;
 
         let initial_state = self.instance_state();
@@ -1181,10 +1207,22 @@ impl Vm {
         mem_path: &std::path::Path,
         msr_list: &[u32],
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
+        use dbs_snapshot::Persist;
+        let vcpu_states = self.vcpu_manager()?.save_state(msr_list)?;
+        let mut state = self.snapshot_metadata_paused(vcpu_states)?;
+        let mut mem_file = std::fs::File::create(mem_path)?;
+        state.memory_state = Some(self.address_space.save_state(&mut mem_file)?);
+        state.save_to_file(state_path)?;
+        Ok(())
+    }
+
+    // Shared serialization only; callers own the distinct pause/barrier contracts.
+    fn snapshot_metadata_paused(
+        &mut self,
+        vcpu_states: Vec<crate::vcpu::VcpuState>,
+    ) -> std::result::Result<crate::snapshot::MicrovmState, crate::snapshot::SnapshotError> {
         use crate::snapshot::{DeviceManagerState, MicrovmState, SnapshotError};
         use dbs_snapshot::Persist;
-
-        let vcpu_states = self.vcpu_manager()?.save_state(msr_list)?;
 
         // VM-scoped KVM state, captured while the vCPUs are paused.
         let vm_kvm_state = {
@@ -1256,18 +1294,12 @@ impl Vm {
         // TODO: balloon, virtio-mem, vhost-net and vhost-user-net are not yet
         // snapshotted; kata-dragonball does not instantiate them.
 
-        let mut mem_file = std::fs::File::create(mem_path)?;
-        let memory_state = self.address_space.save_state(&mut mem_file)?;
-
-        let state = MicrovmState {
+        Ok(MicrovmState {
             vm_kvm_state: Some(vm_kvm_state),
             vcpu_states,
-            memory_state: Some(memory_state),
             device_states,
             ..Default::default()
-        };
-        state.save_to_file(state_path)?;
-        Ok(())
+        })
     }
 
     /// Restore the runtime state of a freshly built microVM from a snapshot.

@@ -159,7 +159,33 @@ fn hold_targets(
 }
 
 impl DeviceManager {
-    fn capture_targets(&self, deadline: Instant) -> Result<Vec<CaptureTarget>> {
+    /// Validate every live control before a caller pauses any vCPU.
+    pub(crate) fn preflight_capture(&self, deadline: Instant) -> Result<()> {
+        self.capture_targets(deadline).map(|_| ())
+    }
+
+    /// Arm all fresh MMIO devices before any activation is replayed.
+    pub(crate) fn arm_capture_restore(&mut self, generation: CaptureGeneration) -> Result<()> {
+        for info in self.block_manager.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached block".into()))?;
+            super::persist::arm_device_capture(device, generation)
+                .map_err(|e| DeviceCaptureError::Rejected(e.to_string()))?;
+        }
+        for info in self.net_manager.info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached net".into()))?;
+            super::persist::arm_device_capture(device, generation)
+                .map_err(|e| DeviceCaptureError::Rejected(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_capture_profile(&self) -> Result<()> {
         #[cfg(feature = "virtio-vsock")]
         if !self.vsock_manager.info_list.is_empty() {
             return Err(DeviceCaptureError::Rejected(
@@ -209,6 +235,33 @@ impl DeviceManager {
             ));
         }
 
+        for info in self.block_manager.iter() {
+            let config = &info.config;
+            if config.device_type != BlockDeviceType::RawBlock
+                || config.drive_id.is_empty()
+                || config.num_queues == 0
+                || config.use_pci_bus == Some(true)
+            {
+                return Err(DeviceCaptureError::Rejected(
+                    "unsupported block device profile".into(),
+                ));
+            }
+        }
+        for info in self.net_manager.info_list.iter() {
+            if !matches!(info.config.backend, Backend::Virtio(_))
+                || info.config.id().is_empty()
+                || info.config.num_queues() != 2
+            {
+                return Err(DeviceCaptureError::Rejected(
+                    "unsupported network device profile".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_targets(&self, deadline: Instant) -> Result<Vec<CaptureTarget>> {
+        self.validate_capture_profile()?;
         let mut targets = Vec::new();
         for info in self.block_manager.iter() {
             let config = &info.config;
