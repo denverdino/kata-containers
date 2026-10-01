@@ -477,6 +477,96 @@ impl VcpuManager {
         self.pause_vcpus(&self.present_vcpus())
     }
 
+    /// Wait for every CPU to leave KVM_RUN, using a dedicated generation reply.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    pub fn capture_pause(
+        &mut self,
+        generation: u64,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<crate::snapshot::capture::VcpuAck>> {
+        self.capture_transition(generation, deadline, false)
+    }
+
+    /// Confirm every CPU's explicit resume under one common deadline.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    pub fn capture_resume(&mut self, generation: u64, deadline: std::time::Instant) -> Result<()> {
+        self.capture_transition(generation, deadline, true)
+            .map(|_| ())
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    fn capture_transition(
+        &mut self,
+        generation: u64,
+        deadline: std::time::Instant,
+        resume: bool,
+    ) -> Result<Vec<crate::snapshot::capture::VcpuAck>> {
+        if generation == 0 || std::time::Instant::now() >= deadline {
+            return Err(VcpuManagerError::UnexpectedVcpuResponse);
+        }
+        let ids = self.present_vcpus();
+        if ids.len() != usize::from(self.vcpu_config.boot_vcpu_count) {
+            return Err(VcpuManagerError::UnexpectedVcpuResponse);
+        }
+        let mut replies = Vec::new();
+        for id in ids {
+            let handle = self.vcpu_infos[id as usize]
+                .handle
+                .as_ref()
+                .ok_or(VcpuManagerError::VcpuNotFound(id))?;
+            let (tx, rx) = channel();
+            let event = if resume {
+                VcpuEvent::CaptureResume(generation, tx)
+            } else {
+                VcpuEvent::CapturePause(generation, tx)
+            };
+            handle
+                .send_capture_event(event)
+                .map_err(VcpuManagerError::VcpuEvent)?;
+            replies.push((id, rx));
+        }
+        let mut acks = Vec::new();
+        for (id, rx) in replies {
+            let ack = rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .map_err(VcpuManagerError::VcpuResponseTimeout)?;
+            if ack.vcpu_id != id || ack.generation != generation {
+                return Err(VcpuManagerError::UnexpectedVcpuResponse);
+            }
+            acks.push(ack);
+        }
+        Ok(acks)
+    }
+
+    /// Save all paused CPUs without extending the caller's deadline per CPU.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    pub fn capture_save(
+        &mut self,
+        msrs: &[u32],
+        deadline: std::time::Instant,
+    ) -> Result<Vec<VcpuState>> {
+        let mut replies = Vec::new();
+        for id in self.present_vcpus() {
+            let handle = self.vcpu_infos[id as usize]
+                .handle
+                .as_ref()
+                .ok_or(VcpuManagerError::VcpuNotFound(id))?;
+            let (tx, rx) = channel();
+            handle
+                .send_capture_event(VcpuEvent::CaptureSave(msrs.to_vec(), tx))
+                .map_err(VcpuManagerError::VcpuEvent)?;
+            replies.push(rx);
+        }
+        replies
+            .into_iter()
+            .map(|rx| {
+                rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .map_err(VcpuManagerError::VcpuResponseTimeout)?
+                    .map_err(VcpuManagerError::Vcpu)
+            })
+            .collect()
+    }
+
     /// resume all vcpus
     pub fn resume_all_vcpus(&mut self) -> Result<()> {
         self.resume_vcpus(&self.present_vcpus())

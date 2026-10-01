@@ -803,9 +803,22 @@ pub struct Net<AS: GuestAddressSpace> {
     metrics: Arc<NetDeviceMetrics>,
     capture_controller: Option<NetCaptureControl>,
     capture_id: String,
+    capture_on_activate: Option<CaptureGeneration>,
 }
 
 impl<AS: GuestAddressSpace> Net<AS> {
+    /// Arm the gate before registering a subscriber, never after activation.
+    pub fn arm_capture(&mut self, generation: CaptureGeneration) -> CaptureResult<()> {
+        if generation.0 == 0
+            || self.capture_controller.is_some()
+            || self.capture_on_activate.is_some()
+        {
+            return Err(CaptureError::StaleGeneration);
+        }
+        self.capture_on_activate = Some(generation);
+        Ok(())
+    }
+
     /// Assign the machine's logical device ID before activation.
     pub fn set_capture_id(&mut self, id: String) -> Result<()> {
         if id.is_empty() || self.capture_controller.is_some() {
@@ -903,6 +916,7 @@ impl<AS: GuestAddressSpace> Net<AS> {
             subscriber_id: None,
             capture_controller: None,
             capture_id: id.clone(),
+            capture_on_activate: None,
             id,
             phantom: PhantomData,
             patch_rate_limiter_fd: EventFd::new(0).unwrap(),
@@ -1052,6 +1066,10 @@ where
         let tx = TxVirtio::<Q>::new(tx_queue, self.tx_rate_limiter.take().unwrap_or_default());
         let patch_rate_limiter_fd = self.patch_rate_limiter_fd.try_clone().unwrap();
 
+        let mut capture = CaptureGate::armed(self.capture_id.clone(), self.capture_on_activate);
+        if capture.is_held() {
+            capture.finish_report(Ok(capture.held_ack(false)));
+        }
         let handler = Arc::new(Mutex::new(NetEpollHandler {
             tap,
             rx,
@@ -1061,7 +1079,7 @@ where
             patch_rate_limiter_fd,
             receiver: Some(receiver),
             metrics: self.metrics.clone(),
-            capture: CaptureGate::new(self.capture_id.clone()),
+            capture,
             tap_suspended: false,
         }));
 
@@ -1281,6 +1299,37 @@ mod tests {
         assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 0);
         assert_eq!(mem.read_obj::<u16>(GuestAddress(0x12a)).unwrap(), 0);
         net.resume_capture(CaptureGeneration(1), deadline).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 1);
+    }
+
+    #[test]
+    fn load_held_net_is_gated_before_subscriber_registration() {
+        let handler = capture_net_fixture();
+        let mut config = handler.config;
+        let mem = config.vm_as.clone();
+        let tx_event = handler.tx.queue.eventfd.clone();
+        config.queues = vec![handler.rx.queue, handler.tx.queue];
+        let manager = EpollManager::default();
+        let mut net = Net::new_with_tap(
+            handler.tap,
+            None,
+            Arc::new(vec![16, 16]),
+            manager.clone(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        net.arm_capture(CaptureGeneration(7)).unwrap();
+        net.activate(config).unwrap();
+        tx_event.write(1).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 0);
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let ack = net.request_hold(CaptureGeneration(7), deadline).unwrap();
+        assert_eq!(ack.generation, 7);
+        net.resume_capture(CaptureGeneration(7), deadline).unwrap();
         manager.handle_events(0).unwrap();
         assert_eq!(mem.read_obj::<u16>(GuestAddress(0x52a)).unwrap(), 1);
     }

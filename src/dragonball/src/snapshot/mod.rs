@@ -40,6 +40,9 @@ use crate::device_manager::net_dev_mgr::NetworkDeviceMgrState;
 use crate::device_manager::vsock_dev_mgr::VsockDeviceMgrState;
 use crate::vcpu::VcpuState;
 
+#[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+pub mod capture;
+
 pub use dbs_snapshot::{check_epoch, PersistError};
 
 /// Aggregated snapshot state of the device manager.
@@ -207,6 +210,10 @@ pub struct MicrovmState {
     /// Device manager state.
     #[serde(default)]
     pub device_states: DeviceManagerState,
+    /// Homogeneous-host requirements of the held capture API; absent in legacy snapshots.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    #[serde(default)]
+    pub capture_cpu: Option<capture::CpuRequirements>,
 }
 
 impl MicrovmState {

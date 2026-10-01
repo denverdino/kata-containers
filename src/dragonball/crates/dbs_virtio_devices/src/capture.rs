@@ -147,6 +147,16 @@ impl CaptureGate {
         self.generation.is_some()
     }
 
+    /// Construct a held gate before any worker/subscriber can touch guest RAM.
+    pub(crate) fn armed(device_id: String, generation: Option<CaptureGeneration>) -> Self {
+        let mut gate = Self::new(device_id);
+        if let Some(generation) = generation {
+            gate.generation = Some(generation);
+            gate.last_generation = generation.0;
+        }
+        gate
+    }
+
     pub(crate) fn needs_ack(&self) -> bool {
         self.is_held() && self.completed.is_none()
     }
