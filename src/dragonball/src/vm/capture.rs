@@ -303,7 +303,10 @@ impl Vm {
                 }
             }
             self.shared_info.write().unwrap().state = InstanceState::Starting;
-            self.init_guest_memory()?;
+            self.init_guest_memory_with_snapshot(Some((
+                state.memory_state.as_ref().unwrap(),
+                &files.memory,
+            )))?;
             let vm_as = self
                 .vm_as()
                 .cloned()
@@ -317,7 +320,7 @@ impl Vm {
             self.device_manager
                 .arm_capture_restore(CaptureGeneration(generation))
                 .map_err(|e| StartMicroVmError::RestoreMicroVm(e.to_string()))?;
-            self.restore_held_state(&state, files)
+            self.restore_held_state(&state)
                 .map_err(|e| StartMicroVmError::RestoreMicroVm(e.to_string()))?;
             self.register_events(events)?;
             self.vcpu_manager()
@@ -355,11 +358,12 @@ impl Vm {
         &self,
         files: &SnapshotFiles,
     ) -> std::result::Result<MicrovmState, SnapshotError> {
-        if !files.state.metadata()?.is_file() || !files.memory.metadata()?.is_file() {
+        if !files.state.metadata()?.is_file() {
             return Err(SnapshotError::InvalidSnapshot(
-                "held snapshot inputs must be regular files".into(),
+                "held snapshot state must be a regular file".into(),
             ));
         }
+        crate::address_space_manager::inspect_memory_backing(&files.memory)?;
         let mut file = files.state.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
         let value: serde_json::Value =
@@ -535,13 +539,8 @@ impl Vm {
     fn restore_held_state(
         &mut self,
         state: &MicrovmState,
-        files: &SnapshotFiles,
     ) -> std::result::Result<(), SnapshotError> {
-        // Validate/install RAM before device activation. CPU state is never run on failure.
-        self.address_space.restore_state(
-            state.memory_state.as_ref().unwrap(),
-            &mut files.memory.try_clone()?,
-        )?;
+        // RAM was fully validated and privately mapped before creating consumers.
         let kvm = state.vm_kvm_state.as_ref().unwrap();
         self.vm_fd.set_pit2(&kvm.pit).map_err(SnapshotError::Kvm)?;
         self.vm_fd
@@ -577,6 +576,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt;
     use std::time::{Duration, Instant};
+    use vm_memory::GuestMemory;
     use vmm_sys_util::tempfile::TempFile;
 
     fn deadline() -> Instant {
@@ -1106,6 +1106,23 @@ mod tests {
         assert_eq!(held_disk, [0; 512]);
         assert_eq!(resumed_used, 1);
         assert_eq!(resumed_disk, [0x5a; 512]);
+        let region = ram.iter().next().unwrap();
+        assert_eq!(
+            region.flags() & libc::MAP_SHARED,
+            0,
+            "held restore metadata must describe private backing"
+        );
+        assert_eq!(
+            region
+                .file_offset()
+                .unwrap()
+                .file()
+                .metadata()
+                .unwrap()
+                .ino(),
+            memory.as_file().metadata().unwrap().ino(),
+            "held region must retain the real snapshot inode"
+        );
         assert_ne!(
             resumed, initial,
             "fixture must actually run after explicit release"

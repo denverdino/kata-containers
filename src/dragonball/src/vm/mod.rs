@@ -675,9 +675,24 @@ impl Vm {
     }
 
     pub(crate) fn init_guest_memory(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        self.init_guest_memory_with_snapshot(None)
+    }
+
+    pub(crate) fn init_guest_memory_with_snapshot(
+        &mut self,
+        snapshot: Option<(
+            &crate::address_space_manager::GuestMemoryState,
+            &std::fs::File,
+        )>,
+    ) -> std::result::Result<(), StartMicroVmError> {
         info!(self.logger, "VM: initializing guest memory...");
         // We are not allowing reinitialization of vm guest memory.
         if self.address_space.is_initialized() {
+            if snapshot.is_some() {
+                return Err(StartMicroVmError::AddressManagerError(
+                    AddressManagerError::InvalidOperation,
+                ));
+            }
             return Ok(());
         }
 
@@ -724,9 +739,15 @@ impl Vm {
         address_space_param.toggle_use_firmware(self.firmware_type.is_some());
         #[cfg(target_arch = "x86_64")]
         address_space_param.toggle_kvm_mem_attr_private(self.kvm_mem_attr_private());
-        self.address_space
-            .create_address_space(&self.resource_manager, &numa_regions, address_space_param)
-            .map_err(StartMicroVmError::AddressManagerError)?;
+        if let Some((state, file)) = snapshot {
+            self.address_space = address_space_param
+                .build_from_snapshot(&self.resource_manager, &numa_regions, state, file)
+                .map_err(StartMicroVmError::AddressManagerError)?;
+        } else {
+            self.address_space
+                .create_address_space(&self.resource_manager, &numa_regions, address_space_param)
+                .map_err(StartMicroVmError::AddressManagerError)?;
+        }
 
         info!(self.logger, "VM: initializing guest memory done");
         Ok(())
