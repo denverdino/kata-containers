@@ -1018,6 +1018,11 @@ impl DeviceManager {
             .attach_devices(&mut ctx)
             .map_err(StartMicroVmError::RngDeviceError)?;
 
+        #[cfg(feature = "virtio-balloon")]
+        self.balloon_manager
+            .attach_devices(&mut ctx)
+            .map_err(StartMicroVmError::BalloonDeviceError)?;
+
         // Non-root writable workload devices were hotplugged after the source VM booted.
         // Recreate them after the boot-time devices so restored MMIO addresses
         // match the guest-visible layout captured in the snapshot.

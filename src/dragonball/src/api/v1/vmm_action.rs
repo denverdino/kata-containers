@@ -2303,7 +2303,21 @@ mod tests {
         skip_if_kvm_unaccessable!();
 
         let tests = &mut [
+            #[cfg(not(all(feature = "hotplug", feature = "dbs-upcall")))]
+            TestData::new(
+                VmmAction::InsertBalloonDevice(BalloonDeviceConfigInfo::default()),
+                InstanceState::Running,
+                &|result| {
+                    assert!(matches!(
+                        result,
+                        Err(VmmActionError::StartMicroVm(
+                            StartMicroVmError::MicroVMAlreadyRunning
+                        ))
+                    ))
+                },
+            ),
             // hotplug unready
+            #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
             TestData::new(
                 VmmAction::InsertBalloonDevice(BalloonDeviceConfigInfo::default()),
                 InstanceState::Running,

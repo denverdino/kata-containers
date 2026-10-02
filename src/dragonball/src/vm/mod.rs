@@ -1331,6 +1331,10 @@ impl Vm {
         {
             device_states.virtio_net = Some(self.device_manager.net_manager.save_state(())?);
         }
+        #[cfg(feature = "virtio-balloon")]
+        {
+            device_states.balloon = Some(self.device_manager.balloon_manager.save_state(())?);
+        }
         #[cfg(feature = "virtio-vsock")]
         {
             device_states.vsock = Some(
@@ -1349,7 +1353,7 @@ impl Vm {
                     .save_state(())?,
             );
         }
-        // TODO: balloon, virtio-mem, vhost-net and vhost-user-net are not yet
+        // TODO: virtio-mem, vhost-net and vhost-user-net are not yet
         // snapshotted; kata-dragonball does not instantiate them.
 
         Ok(MicrovmState {
@@ -1382,6 +1386,18 @@ impl Vm {
 
         let state = MicrovmState::load_from_file(state_path)?;
         state.validate_for_restore(self.vm_config.vcpu_count)?;
+        #[cfg(feature = "virtio-balloon")]
+        if !self.device_manager.balloon_manager.info_list.is_empty()
+            || state
+                .device_states
+                .balloon
+                .as_ref()
+                .is_some_and(|state| !state.devices.is_empty())
+        {
+            return Err(crate::snapshot::SnapshotError::InvalidSnapshot(
+                "balloon snapshots require held restore with checked memory ownership".into(),
+            ));
+        }
 
         // Restore the VM-scoped KVM state first: interrupt delivery for
         // everything below depends on the IOAPIC/PIC redirection tables the
@@ -1441,7 +1457,7 @@ impl Vm {
                 .unwrap()
                 .restore_state(fs_state, ())?;
         }
-        // TODO: balloon, virtio-mem, vhost-net and vhost-user-net are not yet
+        // TODO: virtio-mem, vhost-net and vhost-user-net are not yet
         // snapshotted; kata-dragonball does not instantiate them.
 
         // TODO(security): the guest's RNG/entropy state lives in the restored

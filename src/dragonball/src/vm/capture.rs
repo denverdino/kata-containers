@@ -511,10 +511,12 @@ impl Vm {
             crate::snapshot::FORMAT_EPOCH,
         )?;
         if let Some(devices) = value.get("device_states").and_then(|v| v.as_object()) {
-            if devices
-                .iter()
-                .any(|(name, value)| name != "block" && name != "virtio_net" && !value.is_null())
-            {
+            if devices.iter().any(|(name, value)| {
+                name != "block"
+                    && name != "virtio_net"
+                    && !(cfg!(feature = "virtio-balloon") && name == "balloon")
+                    && !value.is_null()
+            }) {
                 return Err(SnapshotError::InvalidSnapshot(
                     "snapshot contains an unsupported memory writer".into(),
                 ));
@@ -523,6 +525,42 @@ impl Vm {
         let state: MicrovmState =
             serde_json::from_value(value).map_err(crate::snapshot::PersistError::from)?;
         state.validate_for_restore(self.vm_config.vcpu_count)?;
+        #[cfg(feature = "virtio-balloon")]
+        {
+            let saved = state
+                .device_states
+                .balloon
+                .as_ref()
+                .map(|state| state.devices.as_slice())
+                .unwrap_or(&[]);
+            let configured = &self.device_manager.balloon_manager.info_list;
+            if saved.len() != configured.len() {
+                return Err(SnapshotError::InvalidSnapshot(
+                    "balloon device set mismatch".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for device in saved {
+                let config = configured
+                    .iter()
+                    .find(|info| info.config.balloon_id == device.config.balloon_id)
+                    .ok_or_else(|| {
+                        SnapshotError::InvalidSnapshot("unknown balloon device".into())
+                    })?;
+                let crate::device_manager::persist::VirtioTransportState::Mmio(transport) =
+                    &device.transport;
+                if !seen.insert(&device.config.balloon_id)
+                    || config.config.f_reporting != device.config.f_reporting
+                    || config.config.f_deflate_on_oom != device.config.f_deflate_on_oom
+                    || transport.queues.len() != if device.config.f_reporting { 3 } else { 2 }
+                    || !transport.device_activated
+                {
+                    return Err(SnapshotError::InvalidSnapshot(
+                        "unsupported balloon state or queue set".into(),
+                    ));
+                }
+            }
+        }
         let saved_blocks = state
             .device_states
             .block
@@ -697,6 +735,12 @@ impl Vm {
         if let Some(net) = &state.device_states.virtio_net {
             self.device_manager.net_manager.restore_state(net, ())?;
         }
+        #[cfg(feature = "virtio-balloon")]
+        if let Some(balloon) = &state.device_states.balloon {
+            self.device_manager
+                .balloon_manager
+                .restore_state(balloon, ())?;
+        }
         Ok(())
     }
 }
@@ -734,6 +778,240 @@ mod tests {
 
     fn paused_counter_vm() -> (Vm, RealVcpuExecution) {
         paused_counter_vm_with_disk(None)
+    }
+
+    #[cfg(feature = "virtio-balloon")]
+    fn configure_balloon(vm: &mut Vm) {
+        use crate::config_manager::DeviceConfigInfo;
+        use crate::device_manager::balloon_dev_mgr::BalloonDeviceConfigInfo;
+        vm.device_manager
+            .balloon_manager
+            .info_list
+            .push(DeviceConfigInfo::new(BalloonDeviceConfigInfo {
+                balloon_id: "memory".into(),
+                size_mib: 2,
+                use_shared_irq: Some(false),
+                use_generic_irq: Some(false),
+                f_deflate_on_oom: true,
+                f_reporting: true,
+            }));
+    }
+
+    #[cfg(feature = "virtio-balloon")]
+    #[test]
+    fn m2_balloon_restore_preserves_queues_and_progress() {
+        use crate::device_manager::{DbsMmioV2Device, DeviceOpContext};
+        use dbs_virtio_devices::persist::VirtioQueueState;
+        let (mut source, _real) = paused_counter_vm();
+        configure_balloon(&mut source);
+        let mut context = DeviceOpContext::new(
+            Some(source.epoll_manager.clone()),
+            &source.device_manager,
+            source.vm_as().cloned(),
+            source.vm_address_space().cloned(),
+            false,
+            Some(source.vm_config.clone()),
+            source.shared_info.clone(),
+        );
+        source
+            .device_manager
+            .balloon_manager
+            .attach_devices(&mut context)
+            .unwrap();
+        let device = source.device_manager.balloon_manager.info_list[0]
+            .device
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mmio = device.as_any().downcast_ref::<DbsMmioV2Device>().unwrap();
+        {
+            let mut guard = mmio.state();
+            let inner = guard.get_inner_device_mut();
+            inner.set_acked_features(0, (1 << 2) | (1 << 5));
+            inner.set_acked_features(1, 1);
+            inner.write_config(0, &512u32.to_le_bytes()).unwrap();
+            inner.write_config(4, &123u32.to_le_bytes()).unwrap();
+        }
+        let memory = source.address_space.vm_memory().unwrap();
+        memory
+            .write_slice(&[0x51; 8192], GuestAddress(0x9000))
+            .unwrap();
+        // The real CPU copies a reclaimed-then-rewritten page through the same KVM slot.
+        memory
+            .write_slice(
+                &[
+                    0xff, 0x06, 0x00, 0x20, 0xa0, 0x00, 0xa0, 0xa2, 0x00, 0xb0, 0xeb, 0xf4,
+                ],
+                GuestAddress(0x1000),
+            )
+            .unwrap();
+        memory.write_obj(9u32, GuestAddress(0x8000)).unwrap();
+        let mut transport = mmio.save_state();
+        for (index, queue) in transport.queues.iter_mut().enumerate() {
+            let base = 0x4000 + index as u64 * 0x1000;
+            queue.queue = VirtioQueueState {
+                max_size: 128,
+                size: 16,
+                ready: true,
+                next_avail: 7,
+                next_used: 7,
+                desc_table: base,
+                avail_ring: base + 0x200,
+                used_ring: base + 0x300,
+                ..Default::default()
+            };
+            memory
+                .write_obj(
+                    if index == 2 { 0xa000u64 } else { 0x8000 },
+                    GuestAddress(base),
+                )
+                .unwrap();
+            memory
+                .write_obj(if index == 2 { 4096u32 } else { 4 }, GuestAddress(base + 8))
+                .unwrap();
+            memory
+                .write_obj(if index == 2 { 2u16 } else { 0 }, GuestAddress(base + 12))
+                .unwrap();
+            memory.write_obj(8u16, GuestAddress(base + 0x202)).unwrap();
+            memory
+                .write_obj(0u16, GuestAddress(base + 0x204 + 7 * 2))
+                .unwrap();
+            memory.write_obj(7u16, GuestAddress(base + 0x302)).unwrap();
+        }
+        transport.driver_status = 0xf;
+        transport.device_activated = true;
+        mmio.restore_state(&transport).unwrap();
+        let config = source.vm_config.clone();
+        let state_file = TempFile::new().unwrap();
+        let ram_file = TempFile::new().unwrap();
+        let input = files(&state_file, &ram_file);
+        let report = source.begin_capture(1, deadline());
+        if report.is_err() {
+            source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        }
+        let report = report.unwrap();
+        assert_eq!(report.device_acks.len(), 1);
+        assert_eq!(report.device_acks[0].device_id, "balloon:memory");
+        source.export_held_snapshot(1, deadline(), &input).unwrap();
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        drop(memory);
+        drop(source);
+        let (mut legacy, _legacy_real) = paused_counter_vm();
+        let legacy_result = legacy.restore_microvm(state_file.as_path(), ram_file.as_path());
+        legacy.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        assert!(
+            matches!(legacy_result, Err(SnapshotError::InvalidSnapshot(message))
+            if message.contains("held restore"))
+        );
+        let mut lower = vec![0; 16 << 20];
+        input.memory.read_exact_at(&mut lower, 0).unwrap();
+        let epoll = EpollManager::default();
+        let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+            epoll.clone(),
+        )));
+        let mut events = EventManager::new(&vmm, epoll.clone()).unwrap();
+        let mut vmm = vmm.lock().unwrap();
+        let target = vmm.get_vm_mut().unwrap();
+        let real = RealVcpuExecution::new(target.vm_fd.clone());
+        target.set_vm_config(config);
+        configure_balloon(target);
+        target
+            .load_snapshot_held(&mut events, Default::default(), &input, 1, deadline())
+            .unwrap();
+        let restored = target.device_manager.balloon_manager.info_list[0]
+            .device
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mmio = restored.as_any().downcast_ref::<DbsMmioV2Device>().unwrap();
+        assert_eq!(mmio.save_state().queues, transport.queues);
+        assert!(mmio.save_state().device_activated);
+        let mut config_bytes = [0u8; 8];
+        mmio.state()
+            .get_inner_device_mut()
+            .read_config(0, &mut config_bytes)
+            .unwrap();
+        assert_eq!(&config_bytes[..4], &512u32.to_le_bytes());
+        assert_eq!(&config_bytes[4..], &123u32.to_le_bytes());
+        epoll.handle_events(0).unwrap();
+        let ram = target.address_space.vm_memory().unwrap();
+        assert_eq!(ram.read_obj::<u16>(GuestAddress(0x6302)).unwrap(), 7);
+        assert_eq!(ram.read_obj::<u8>(GuestAddress(0xa000)).unwrap(), 0x51);
+        assert_eq!(real.run_count(), 0);
+        target.end_capture(1, deadline(), false).unwrap();
+        epoll.handle_events(0).unwrap();
+        for index in 0..3 {
+            assert_eq!(
+                ram.read_obj::<u16>(GuestAddress(0x4302 + index * 0x1000))
+                    .unwrap(),
+                8
+            );
+        }
+        assert_eq!(ram.read_obj::<u8>(GuestAddress(0x9000)).unwrap(), 0);
+        assert_eq!(ram.read_obj::<u8>(GuestAddress(0xa000)).unwrap(), 0);
+        target.begin_capture(2, deadline()).unwrap();
+        let zero = target.export_held_memory_map(2, deadline()).unwrap();
+        assert!(
+            zero.changed_ranges
+                .iter()
+                .map(|range| range.length)
+                .sum::<u64>()
+                < 16 << 20
+        );
+        for page in [0x4000, 0x5000, 0x6000, 0x9000, 0xa000] {
+            assert!(zero.changed_ranges.iter().any(
+                |range| range.image_offset <= page && range.image_offset + range.length > page
+            ));
+        }
+        assert!(zero.zero_ranges.iter().any(
+            |range| range.image_offset <= 0xa000 && range.image_offset + range.length > 0xa000
+        ));
+        target.release_held_memory_map(2).unwrap();
+        target.end_capture(2, deadline(), false).unwrap();
+        ram.write_obj(0x93u8, GuestAddress(0xa000)).unwrap();
+        target.begin_capture(3, deadline()).unwrap();
+        let rewritten = target.export_held_memory_map(3, deadline()).unwrap();
+        assert!(rewritten.changed_ranges.iter().any(
+            |range| range.image_offset <= 0xa000 && range.image_offset + range.length > 0xa000
+        ));
+        assert!(!rewritten.zero_ranges.iter().any(
+            |range| range.image_offset <= 0xa000 && range.image_offset + range.length > 0xa000
+        ));
+        let mut after = vec![0; lower.len()];
+        input.memory.read_exact_at(&mut after, 0).unwrap();
+        assert_eq!(after, lower);
+        target.release_held_memory_map(3).unwrap();
+        target.end_capture(3, deadline(), true).unwrap();
+        let limit = deadline();
+        while ram.read_obj::<u8>(GuestAddress(0xb000)).unwrap() != 0x93 && Instant::now() < limit {
+            std::thread::yield_now();
+        }
+        target.begin_capture(4, deadline()).unwrap();
+        assert!(real.run_count() > 0);
+        assert_eq!(ram.read_obj::<u8>(GuestAddress(0xa000)).unwrap(), 0x93);
+        assert_eq!(ram.read_obj::<u8>(GuestAddress(0xb000)).unwrap(), 0x93);
+        let map = target.export_held_memory_map(4, deadline()).unwrap();
+        let mut rebuilt = lower.clone();
+        for range in &map.changed_ranges {
+            ram.read_slice(
+                &mut rebuilt
+                    [range.image_offset as usize..(range.image_offset + range.length) as usize],
+                GuestAddress(range.image_offset),
+            )
+            .unwrap();
+        }
+        let full_state = TempFile::new().unwrap();
+        let full_ram = TempFile::new().unwrap();
+        target
+            .export_held_snapshot(4, deadline(), &files(&full_state, &full_ram))
+            .unwrap();
+        full_ram.as_file().read_exact_at(&mut after, 0).unwrap();
+        assert_eq!(
+            rebuilt, after,
+            "balloon + CPU delta must match the held full export"
+        );
+        target.release_held_memory_map(4).unwrap();
+        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
     }
 
     #[test]

@@ -72,6 +72,114 @@ pub type GuestMemoryImpl = <Arc<GuestMemoryMmap> as GuestAddressSpace>::M;
 /// Concrete GuestRegion type used by the VMM.
 pub type GuestRegionImpl = GuestRegionMmap;
 
+/// Owns RAM references and records anonymous overrides of the original backing.
+/// The region FileOffset describes the ancestor, not these overridden pages.
+#[cfg(feature = "virtio-balloon")]
+pub struct PrivateMemoryReclaimer {
+    memory: GuestAddressSpaceImpl,
+    anonymous_ranges: Mutex<Vec<(u64, u64)>>,
+}
+
+#[cfg(feature = "virtio-balloon")]
+impl dbs_virtio_devices::balloon::BalloonReclaimer for PrivateMemoryReclaimer {
+    fn reclaim_private_range(&self, guest_addr: u64, length: u64) -> std::io::Result<()> {
+        PrivateMemoryReclaimer::reclaim_private_range(self, guest_addr, length)
+    }
+}
+
+#[cfg(feature = "virtio-balloon")]
+impl PrivateMemoryReclaimer {
+    /// Retain the real mapping owners for every device reclamation callback.
+    pub fn new(memory: GuestAddressSpaceImpl) -> Self {
+        Self {
+            memory,
+            anonymous_ranges: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Replace guest-returned full pages without touching the shared ancestor.
+    pub fn reclaim_private_range(&self, guest_addr: u64, length: u64) -> std::io::Result<()> {
+        use std::convert::TryFrom;
+        use vm_memory::bitmap::Bitmap;
+        let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        let end = guest_addr.checked_add(length).ok_or_else(invalid)?;
+        let length_usize = usize::try_from(length).map_err(|_| invalid())?;
+        let memory = self.memory.memory();
+        if length == 0
+            || !guest_addr.is_multiple_of(4096)
+            || !length.is_multiple_of(4096)
+            || unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != 4096
+            || !memory.check_range(GuestAddress(guest_addr), length_usize)
+        {
+            return Err(invalid());
+        }
+        // Validate every segment before replacing any mapping, including a GPA hole.
+        let mut segments = Vec::new();
+        for region in memory.iter() {
+            let start = guest_addr.max(region.start_addr().0);
+            let stop = end.min(
+                region
+                    .start_addr()
+                    .0
+                    .checked_add(region.len())
+                    .ok_or_else(invalid)?,
+            );
+            if start >= stop {
+                continue;
+            }
+            let offset = start - region.start_addr().0;
+            let host = region
+                .get_host_address(MemoryRegionAddress(offset))
+                .map_err(|_| invalid())?;
+            if !(host as usize).is_multiple_of(4096) || !(stop - start).is_multiple_of(4096) {
+                return Err(invalid());
+            }
+            segments.push((region, start, stop, offset, host));
+        }
+        let mut ranges = self
+            .anonymous_ranges
+            .lock()
+            .map_err(|_| std::io::Error::other("RAM owner poisoned"))?;
+        for (region, start, stop, offset, host) in segments {
+            // SAFETY: the retained region owns this complete, validated page range.
+            // Keep its HVA (and KVM slot) fixed. MAP_FIXED replaces only these pages;
+            // the region still unmaps the entire owned span when its last Arc drops.
+            // KVM's MMU notifier invalidates translations to the previous pages.
+            let mapping = unsafe {
+                libc::mmap(
+                    host.cast(),
+                    (stop - start) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if mapping == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            region
+                .bitmap()
+                .mark_dirty(offset as usize, (stop - start) as usize);
+            // Record successful segments even if a later mmap fails. These ranges
+            // describe anonymous backing, not content: later writes need not be zero.
+            let (mut left, mut right) = (start, stop);
+            ranges.retain(|&(a, b)| {
+                if b < left || a > right {
+                    true
+                } else {
+                    left = left.min(a);
+                    right = right.max(b);
+                    false
+                }
+            });
+            ranges.push((left, right));
+            ranges.sort_unstable();
+        }
+        Ok(())
+    }
+}
+
 // Maximum number of working threads for memory pre-allocation.
 const MAX_PRE_ALLOC_THREAD: u64 = 16;
 
@@ -1311,6 +1419,93 @@ mod tests {
         file.read_exact_at(&mut lower, 0).unwrap();
         assert_eq!(&lower[..4096], &[0x51; 4096]);
         assert!(lower[4096..].iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(feature = "virtio-balloon")]
+    #[test]
+    fn m2_balloon_reclaim_zero_rewrite_keeps_lower() {
+        use std::os::unix::fs::FileExt;
+        let backing = TempFile::new().unwrap();
+        let original = vec![0x51; 1 << 20];
+        backing.as_file().write_all_at(&original, 0).unwrap();
+        let file = File::open(backing.as_path()).unwrap();
+        let state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                guest_addr: GUEST_MEM_START,
+                size: 1 << 20,
+                file_offset: 0,
+            }],
+        };
+        let create = || {
+            AddressSpaceMgrBuilder::new("shmem", "")
+                .unwrap()
+                .build_from_snapshot(
+                    &ResourceManager::new(None),
+                    &[NumaRegionInfo {
+                        size: 1,
+                        host_numa_node_id: None,
+                        guest_numa_node_id: Some(0),
+                        vcpu_ids: vec![0],
+                    }],
+                    &state,
+                    &file,
+                )
+                .unwrap()
+        };
+        let first = create();
+        let sibling = create();
+        let memory = first.vm_memory().unwrap();
+        let address = GuestAddress(GUEST_MEM_START);
+        let host = memory.get_host_address(address).unwrap();
+        memory.write_slice(&vec![0x72; 1 << 20], address).unwrap();
+        for region in memory.iter() {
+            region.deref().bitmap().reset();
+        }
+        let owner = PrivateMemoryReclaimer::new(first.vm_as.clone().unwrap());
+        // mincore proves private resident pages are actually released, before any read faults.
+        let resident = || {
+            let mut pages = vec![0u8; 256];
+            assert_eq!(
+                unsafe { libc::mincore(host.cast(), 1 << 20, pages.as_mut_ptr()) },
+                0
+            );
+            pages.iter().filter(|value| **value & 1 != 0).count()
+        };
+        assert_eq!(resident(), 256);
+        owner
+            .reclaim_private_range(GUEST_MEM_START, 1 << 20)
+            .unwrap();
+        assert_eq!(resident(), 0, "reclaim must release resident COW pages");
+        assert_eq!(memory.get_host_address(address).unwrap(), host);
+        let mut result = vec![0xff; 1 << 20];
+        memory.read_slice(&mut result, address).unwrap();
+        assert!(result.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            *owner.anonymous_ranges.lock().unwrap(),
+            vec![(GUEST_MEM_START, GUEST_MEM_START + (1 << 20))]
+        );
+        assert!(memory.iter().next().unwrap().bitmap().dirty_at(0));
+        memory.write_obj(0x93u8, address).unwrap();
+        assert_eq!(memory.read_obj::<u8>(address).unwrap(), 0x93);
+        for other in [sibling, create()] {
+            other
+                .vm_memory()
+                .unwrap()
+                .read_slice(&mut result, address)
+                .unwrap();
+            assert_eq!(result, original);
+        }
+        file.read_exact_at(&mut result, 0).unwrap();
+        assert_eq!(result, original);
+        for (addr, len) in [
+            (GUEST_MEM_START + 1, 4096),
+            (GUEST_MEM_START, 1),
+            (GUEST_MEM_START, (1 << 20) + 4096),
+            (u64::MAX - 4095, 4096),
+        ] {
+            assert!(owner.reclaim_private_range(addr, len).is_err());
+        }
+        assert_eq!(memory.read_obj::<u8>(address).unwrap(), 0x93);
     }
 
     #[test]
