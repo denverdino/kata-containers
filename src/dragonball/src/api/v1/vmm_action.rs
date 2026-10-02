@@ -1856,6 +1856,8 @@ mod tests {
                     is_root_device: true,
                     part_uuid: None,
                     is_read_only: false,
+                    is_volume_slot: false,
+                    backing_read_only: None,
                     is_direct: false,
                     no_drop: false,
                     drive_id: String::from("1"),

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::{
-    collections::{vec_deque, VecDeque},
+    collections::{vec_deque, BTreeMap, VecDeque},
     sync::mpsc,
 };
 
@@ -199,9 +199,15 @@ pub struct BlockDeviceConfigInfo {
     /// Part-UUID. Represents the unique id of the boot partition of this device.
     /// It is optional and it will be used only if the `is_root_device` field is true.
     pub part_uuid: Option<String>,
-    /// If set to true, the drive is opened in read-only mode. Otherwise, the
-    /// drive is opened as read-write.
+    /// Guest-visible read-only feature and default backing access.
+    /// Reserved RW-capable slots may override backing access only.
     pub is_read_only: bool,
+    /// Reserved RW-capable slot whose backing can be bound before held restore.
+    #[serde(default)]
+    pub is_volume_slot: bool,
+    /// Backing access, independent of the guest-negotiated read-only feature.
+    #[serde(default)]
+    pub backing_read_only: Option<bool>,
     /// If set to false, the drive is opened with buffered I/O mode. Otherwise, the
     /// drive is opened with direct I/O mode.
     pub is_direct: bool,
@@ -233,6 +239,8 @@ impl std::default::Default for BlockDeviceConfigInfo {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: Self::default_direct(),
             no_drop: Self::default_no_drop(),
             sparse: false,
@@ -334,9 +342,70 @@ pub struct BlockDeviceMgr {
     read_only_root: bool,
     part_uuid: Option<String>,
     use_shared_irq: bool,
+    restore_bindings: BTreeMap<String, RestoreBlockBinding>,
+}
+
+/// Checked backing supplied for an explicitly reserved volume slot.
+#[derive(Clone, Debug)]
+pub struct RestoreBlockBinding {
+    /// Stable ID from the captured slot configuration.
+    pub slot_id: String,
+    /// New regular-file or block-device backing.
+    pub path: PathBuf,
+    /// Exact backing capacity in bytes.
+    pub capacity_bytes: u64,
+    /// Open the backing read-only without changing negotiated features.
+    pub backing_read_only: bool,
 }
 
 impl BlockDeviceMgr {
+    /// Whether an explicit checked binding permits changing this slot's backing access.
+    pub(crate) fn has_restore_slot_binding(&self, drive_id: &str) -> bool {
+        self.restore_bindings.contains_key(drive_id)
+    }
+
+    /// Bind an explicit reserved slot before constructing devices.
+    pub fn restore_slot_binding(
+        &mut self,
+        binding: &RestoreBlockBinding,
+    ) -> std::result::Result<(), BlockDeviceError> {
+        let index = self
+            .get_index_of_drive_id(&binding.slot_id)
+            .ok_or_else(|| InvalidDeviceId(binding.slot_id.clone()))?;
+        let info = &self.info_list[index];
+        let config = &info.config;
+        if !config.is_volume_slot
+            || config.is_read_only
+            || config.is_root_device
+            || config.use_pci_bus == Some(true)
+            || config.device_type != BlockDeviceType::RawBlock
+            || info.device.is_some()
+            || binding.capacity_bytes == 0
+            || binding.capacity_bytes & 511 != 0
+            || self
+                .info_list
+                .iter()
+                .enumerate()
+                .any(|(other, info)| other != index && info.config.path_on_host == binding.path)
+        {
+            return Err(BlockDeviceError::Virtio(virtio::Error::InvalidInput));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(!binding.backing_read_only)
+            .open(&binding.path)
+            .map_err(BlockDeviceError::OpenBlockDevice)?;
+        let backing = crate::address_space_manager::inspect_memory_backing(&file)
+            .map_err(|_| BlockDeviceError::Virtio(virtio::Error::InvalidInput))?;
+        if backing.capacity != binding.capacity_bytes {
+            return Err(BlockDeviceError::Virtio(virtio::Error::InvalidInput));
+        }
+        self.info_list[index].config.path_on_host = binding.path.clone();
+        self.info_list[index].config.backing_read_only = Some(binding.backing_read_only);
+        self.restore_bindings
+            .insert(binding.slot_id.clone(), binding.clone());
+        Ok(())
+    }
     /// returns a front-to-back iterator.
     pub fn iter(&self) -> vec_deque::Iter<'_, BlockDeviceInfo> {
         self.info_list.iter()
@@ -558,8 +627,22 @@ impl BlockDeviceMgr {
 
                     let use_shared_irq = info.config.use_shared_irq.unwrap_or(self.use_shared_irq);
                     let use_generic_irq = info.config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ);
-                    let device = Self::create_blk_device(&info.config, ctx)
+                    let mut device = Self::create_blk_device(&info.config, ctx)
                         .map_err(BlockDeviceError::Virtio)?;
+                    if let Some(binding) = self.restore_bindings.get(&info.config.drive_id) {
+                        if !info.config.is_volume_slot
+                            || info.config.is_read_only
+                            || info.config.is_root_device
+                            || info.config.use_pci_bus == Some(true)
+                            || info.config.path_on_host != binding.path
+                            || info.config.backing_read_only != Some(binding.backing_read_only)
+                        {
+                            return Err(BlockDeviceError::Virtio(virtio::Error::InvalidInput));
+                        }
+                        device
+                            .set_restore_slot_capacity(binding.capacity_bytes)
+                            .map_err(BlockDeviceError::Virtio)?;
+                    }
 
                     let device = if let Some(true) = info.config.use_pci_bus {
                         #[cfg(not(feature = "host-device"))]
@@ -571,6 +654,14 @@ impl BlockDeviceMgr {
                             DeviceManager::create_virtio_pci_device(device, ctx, use_generic_irq)
                                 .map_err(BlockDeviceError::RegisterBlockDevice)?
                         }
+                    } else if info.config.is_volume_slot {
+                        DeviceManager::create_mmio_virtio_device_with_device_change_notification(
+                            device,
+                            ctx,
+                            use_shared_irq,
+                            use_generic_irq,
+                        )
+                        .map_err(BlockDeviceError::RegisterBlockDevice)?
                     } else {
                         DeviceManager::create_mmio_virtio_device(
                             device,
@@ -725,6 +816,12 @@ impl BlockDeviceMgr {
     ) -> std::result::Result<Box<Block<GuestAddressSpaceImpl>>, virtio::Error> {
         let epoll_mgr = ctx.epoll_mgr.clone().ok_or(virtio::Error::InvalidInput)?;
 
+        if cfg.backing_read_only.is_some()
+            && (!cfg.is_volume_slot || cfg.is_read_only || cfg.is_root_device)
+        {
+            return Err(virtio::Error::InvalidInput);
+        }
+
         let mut block_files: Vec<Box<dyn Ufile>> = vec![];
 
         match cfg.device_type {
@@ -750,7 +847,7 @@ impl BlockDeviceMgr {
                     let file = OpenOptions::new()
                         .read(true)
                         .custom_flags(custom_flags)
-                        .write(!cfg.is_read_only())
+                        .write(!cfg.backing_read_only.unwrap_or(cfg.is_read_only()))
                         .open(cfg.path_on_host())?;
                     info!(ctx.logger(), "Queue {}: block file opened", i);
 
@@ -946,6 +1043,7 @@ impl BlockDeviceMgr {
             }
         }
         // Update the config.
+        self.restore_bindings.remove(&new_config.drive_id);
         self.info_list[index].config = new_config;
 
         Ok(())
@@ -1101,7 +1199,9 @@ impl<'a> dbs_snapshot::Persist<'a> for BlockDeviceMgr {
             // refused rather than guessed.
             let index = match self.get_index_of_drive_id(&dev_state.config.drive_id) {
                 Some(index) => index,
-                None if self.info_list.len() == state.devices.len()
+                None if !dev_state.config.is_volume_slot
+                    && self.info_list.len() == state.devices.len()
+                    && !self.info_list[pos].config.is_volume_slot
                     && self.info_list[pos].config.path_on_host == dev_state.config.path_on_host =>
                 {
                     log::warn!(
@@ -1122,6 +1222,18 @@ impl<'a> dbs_snapshot::Persist<'a> for BlockDeviceMgr {
                     device_type: dev_state.config.device_type,
                 });
             }
+            let config = &self.info_list[index].config;
+            if config.is_volume_slot != dev_state.config.is_volume_slot
+                || config.is_read_only != dev_state.config.is_read_only
+                || (config.backing_read_only.unwrap_or(config.is_read_only)
+                    != dev_state
+                        .config
+                        .backing_read_only
+                        .unwrap_or(dev_state.config.is_read_only)
+                    && !self.has_restore_slot_binding(&config.drive_id))
+            {
+                return Err(BlockDeviceError::Virtio(virtio::Error::InvalidInput));
+            }
             let BlockDeviceState::RawBlock(device_info) = &dev_state.device_info;
             let device = self.info_list[index]
                 .device
@@ -1134,6 +1246,18 @@ impl<'a> dbs_snapshot::Persist<'a> for BlockDeviceMgr {
                 (),
             )
             .map_err(BlockDeviceError::Virtio)?;
+            if let Some(binding) = self.restore_bindings.get(&dev_state.config.drive_id) {
+                if device_info.config_space.get(..8)
+                    != Some(&(binding.capacity_bytes / 512).to_le_bytes()[..])
+                {
+                    device
+                        .as_any()
+                        .downcast_ref::<DbsMmioV2Device>()
+                        .ok_or(BlockDeviceError::Virtio(virtio::Error::InvalidInput))?
+                        .notify_config_change()
+                        .map_err(BlockDeviceError::Virtio)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1173,6 +1297,7 @@ impl Default for BlockDeviceMgr {
             read_only_root: false,
             part_uuid: None,
             use_shared_irq: USE_SHARED_IRQ,
+            restore_bindings: BTreeMap::new(),
         }
     }
 }
@@ -1206,6 +1331,63 @@ mod tests {
     }
 
     #[test]
+    fn m2_slot_binding_checks_backing_before_mutation() {
+        let placeholder = TempFile::new().unwrap();
+        placeholder.as_file().set_len(4096).unwrap();
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(16384).unwrap();
+        let original = BlockDeviceConfigInfo {
+            drive_id: "slot0".into(),
+            path_on_host: placeholder.as_path().into(),
+            is_volume_slot: true,
+            is_direct: false,
+            ..Default::default()
+        };
+        let mut manager = BlockDeviceMgr::default();
+        manager.create(original.clone()).unwrap();
+        let binding = RestoreBlockBinding {
+            slot_id: "slot0".into(),
+            path: backing.as_path().into(),
+            capacity_bytes: 16384,
+            backing_read_only: true,
+        };
+        let mut bad = binding.clone();
+        bad.capacity_bytes = 8192;
+        assert!(manager.restore_slot_binding(&bad).is_err());
+        assert_eq!(manager.info_list[0].config, original);
+        manager.restore_slot_binding(&binding).unwrap();
+        let configured = &manager.info_list[0].config;
+        assert_eq!(configured.path_on_host, backing.as_path());
+        assert_eq!(configured.backing_read_only, Some(true));
+        assert!(!configured.is_read_only);
+        assert!(manager.info_list[0].device.is_none());
+        manager.update(0, original.clone()).unwrap();
+        assert!(
+            !manager.has_restore_slot_binding("slot0"),
+            "a normal config update must invalidate old binding authority"
+        );
+
+        for (reserved, guest_ro, root, pci) in [
+            (false, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+        ] {
+            let mut manager = BlockDeviceMgr::default();
+            let config = BlockDeviceConfigInfo {
+                is_volume_slot: reserved,
+                is_read_only: guest_ro,
+                is_root_device: root,
+                use_pci_bus: Some(pci),
+                ..original.clone()
+            };
+            manager.create(config.clone()).unwrap();
+            assert!(manager.restore_slot_binding(&binding).is_err());
+            assert_eq!(manager.info_list[0].config, config);
+        }
+    }
+
+    #[test]
     fn test_add_non_root_block_device() {
         skip_if_kvm_unaccessable!();
         let dummy_file = TempFile::new().unwrap();
@@ -1217,6 +1399,8 @@ mod tests {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: dummy_id.clone(),
@@ -1294,6 +1478,8 @@ mod tests {
             is_root_device: true,
             part_uuid: None,
             is_read_only: true,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("1"),
@@ -1373,6 +1559,8 @@ mod tests {
             is_root_device: true,
             part_uuid: None,
             is_read_only: true,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("1"),
@@ -1416,6 +1604,8 @@ mod tests {
             is_root_device: true,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("1"),
@@ -1436,6 +1626,8 @@ mod tests {
             is_root_device: true,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("2"),
@@ -1475,6 +1667,8 @@ mod tests {
             is_root_device: true,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("1"),
@@ -1495,6 +1689,8 @@ mod tests {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("2"),
@@ -1515,6 +1711,8 @@ mod tests {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("3"),
@@ -1577,6 +1775,8 @@ mod tests {
             is_root_device: true,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("1"),
@@ -1597,6 +1797,8 @@ mod tests {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("2"),
@@ -1617,6 +1819,8 @@ mod tests {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("3"),
@@ -1680,6 +1884,8 @@ mod tests {
             is_root_device: true,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("1"),
@@ -1700,6 +1906,8 @@ mod tests {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("2"),
@@ -1798,6 +2006,8 @@ mod tests {
             is_root_device: false,
             part_uuid: None,
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("1"),
@@ -1815,6 +2025,8 @@ mod tests {
             is_root_device: true,
             part_uuid: Some("0eaa91a0-01".to_string()),
             is_read_only: false,
+            is_volume_slot: false,
+            backing_read_only: None,
             is_direct: false,
             no_drop: false,
             drive_id: String::from("2"),

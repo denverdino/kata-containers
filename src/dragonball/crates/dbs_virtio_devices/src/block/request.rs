@@ -345,15 +345,16 @@ impl Request {
         disk: &mut Box<dyn Ufile>,
         data_descs: &[IoDataDesc],
     ) -> result::Result<(), ExecuteError> {
-        for d in data_descs {
-            let mut top = (d.data_len as u64 + SECTOR_SIZE - 1) & !(SECTOR_SIZE - 1u64);
-
-            top = top
-                .checked_add(self.sector << SECTOR_SHIFT)
-                .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
-            if top > disk.get_capacity() {
-                return Err(ExecuteError::BadRequest(Error::InvalidOffset));
-            }
+        let bytes = data_descs
+            .iter()
+            .try_fold(0u64, |total, d| total.checked_add(d.data_len as u64));
+        let top = bytes
+            .and_then(|bytes| bytes.checked_add(SECTOR_SIZE - 1))
+            .map(|bytes| bytes & !(SECTOR_SIZE - 1))
+            .and_then(|bytes| self.sector.checked_mul(SECTOR_SIZE)?.checked_add(bytes))
+            .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
+        if top > disk.get_capacity() {
+            return Err(ExecuteError::BadRequest(Error::InvalidOffset));
         }
 
         Ok(())

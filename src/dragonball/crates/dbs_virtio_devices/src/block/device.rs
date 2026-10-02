@@ -76,6 +76,7 @@ pub struct Block<AS: DbsGuestAddressSpace> {
     capture_controls: Vec<WorkerCaptureControl>,
     capture_id: String,
     capture_on_activate: Option<CaptureGeneration>,
+    restore_slot_capacity: Option<u64>,
     phantom: PhantomData<AS>,
 }
 
@@ -153,7 +154,26 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             capture_controls: Vec::with_capacity(num_queues),
             capture_id: BLK_DRIVER_NAME.to_string(),
             capture_on_activate: None,
+            restore_slot_capacity: None,
         })
+    }
+
+    /// Permit a checked reserved-slot capacity when replaying captured device state.
+    pub fn set_restore_slot_capacity(&mut self, capacity_bytes: u64) -> Result<()> {
+        if capacity_bytes == 0
+            || capacity_bytes & (SECTOR_SIZE - 1) != 0
+            || self.disk_images.is_empty()
+            || !self.capture_controls.is_empty()
+            || self
+                .disk_images
+                .iter()
+                .any(|disk| disk.get_capacity() != capacity_bytes)
+            || self.device_info.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+        {
+            return Err(Error::InvalidInput);
+        }
+        self.restore_slot_capacity = Some(capacity_bytes);
+        Ok(())
     }
 
     /// Arm capture before starting any independent I/O worker.
@@ -309,7 +329,19 @@ impl<'a, AS: DbsGuestAddressSpace> crate::persist::VirtioDevicePersist<'a> for B
     /// The device must have been re-created with the same configuration and
     /// must not have been activated yet.
     fn restore_state(&mut self, state: &Self::State, _args: ()) -> crate::Result<()> {
-        self.device_info.restore_state(state)
+        if self.disk_images.is_empty()
+            || state.config_space.len() != self.device_info.config_space.len()
+            || state.config_space.len() < 8
+        {
+            return Err(Error::InvalidInput);
+        }
+        let mut state = state.clone();
+        if let Some(capacity) = self.restore_slot_capacity {
+            state.config_space[..8].copy_from_slice(&(capacity / SECTOR_SIZE).to_le_bytes());
+        } else if state.config_space[..8] != self.device_info.config_space[..8] {
+            return Err(Error::InvalidInput);
+        }
+        self.device_info.restore_state(&state)
     }
 }
 
@@ -1918,6 +1950,93 @@ mod tests {
             "read-only request header must stay clean"
         );
         assert!(!bitmap.dirty_at(0x6000), "unrelated RAM must stay clean");
+    }
+
+    fn m2_slot_block(capacity: u64, read_only: bool) -> Block<Arc<GuestMemoryMmap>> {
+        let backing = TempFile::new().unwrap().into_file();
+        backing.set_len(capacity).unwrap();
+        let aio = Aio::new(backing.as_raw_fd(), 16).unwrap();
+        Block::new(
+            vec![Box::new(LocalFile::new(backing, false, aio).unwrap())],
+            read_only,
+            false,
+            Arc::new(vec![16]),
+            EpollManager::default(),
+            vec![],
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn m2_slot_capacity_not_restored_from_placeholder() {
+        use crate::persist::VirtioDevicePersist;
+        let mut source = m2_slot_block(4096, false);
+        source.device_info.acked_features = source.device_info.avail_features;
+        let saved = source.save_state(()).unwrap();
+        for capacity in [512, 16384] {
+            let mut child = m2_slot_block(capacity, false);
+            child.set_restore_slot_capacity(capacity).unwrap();
+            child.restore_state(&saved, ()).unwrap();
+            assert_eq!(
+                &child.device_info.config_space[..8],
+                &(capacity / 512).to_le_bytes()
+            );
+            assert_eq!(
+                &child.device_info.config_space[8..],
+                &saved.config_space[8..]
+            );
+            assert_eq!(child.device_info.acked_features, saved.acked_features);
+        }
+        let mut ordinary = m2_slot_block(16384, false);
+        assert!(
+            ordinary.restore_state(&saved, ()).is_err(),
+            "ordinary disks must not inherit slot relaxation"
+        );
+    }
+
+    #[test]
+    fn m2_slot_rejects_illegal_feature_transition() {
+        use crate::persist::VirtioDevicePersist;
+        let mut source = m2_slot_block(4096, true);
+        source.device_info.acked_features = source.device_info.avail_features;
+        let saved = source.save_state(()).unwrap();
+        let mut child = m2_slot_block(16384, false);
+        child.set_restore_slot_capacity(16384).unwrap();
+        assert!(child.restore_state(&saved, ()).is_err());
+        assert!(child.set_restore_slot_capacity(16385).is_err());
+        assert!(child.set_restore_slot_capacity(32768).is_err());
+    }
+
+    #[test]
+    fn m2_slot_request_boundary_checks_whole_transfer() {
+        let mut block = m2_slot_block(512, false);
+        let request = Request {
+            request_type: RequestType::In,
+            sector: 0,
+            status_addr: GuestAddress(0),
+            request_index: 0,
+        };
+        let buffers = [
+            IoDataDesc {
+                data_addr: 0x1000,
+                data_len: 512,
+            },
+            IoDataDesc {
+                data_addr: 0x2000,
+                data_len: 512,
+            },
+        ];
+        assert!(request
+            .check_capacity(&mut block.disk_images[0], &buffers)
+            .is_err());
+        let overflow = Request {
+            sector: 1 << 55,
+            ..request
+        };
+        assert!(overflow
+            .check_capacity(&mut block.disk_images[0], &buffers[..1])
+            .is_err());
     }
 
     #[test]

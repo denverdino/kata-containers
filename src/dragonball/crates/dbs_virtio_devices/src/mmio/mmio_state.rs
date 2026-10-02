@@ -227,6 +227,16 @@ where
         Ok(config)
     }
 
+    pub(crate) fn notify_config_change(&self, device: &MmioV2Device<AS, Q, R>) -> Result<()> {
+        if !self.device_activated {
+            return Err(Error::InvalidInput);
+        }
+        let group = self.intr_mgr.get_group().ok_or(Error::InvalidInput)?;
+        crate::notifier::create_device_notifier(group, device.interrupt_status(), 0)
+            .notify()
+            .map_err(Error::IOError)
+    }
+
     fn register_ioevent(&mut self) -> Result<()> {
         for (i, queue) in self.queues.iter().enumerate() {
             if let Some(doorbell) = self.doorbell.as_ref() {

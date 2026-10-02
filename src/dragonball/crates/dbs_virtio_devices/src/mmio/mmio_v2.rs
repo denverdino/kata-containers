@@ -233,6 +233,17 @@ where
         Ok(())
     }
 
+    /// Publish a device configuration change after activation or held restore.
+    /// Queue positions and the negotiated feature set are unaffected.
+    pub fn notify_config_change(&self) -> Result<()> {
+        let inner = self.state();
+        if !inner.device_activated() {
+            return Err(Error::InvalidInput);
+        }
+        self.config_generation.fetch_add(1, Ordering::SeqCst);
+        inner.notify_config_change(self)
+    }
+
     #[inline]
     fn check_driver_status(&self, set: u32, clr: u32) -> bool {
         self.driver_status() & (set | clr) == set
