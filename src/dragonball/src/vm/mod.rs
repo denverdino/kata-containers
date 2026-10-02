@@ -736,6 +736,8 @@ impl Vm {
         let mut address_space_param = AddressSpaceMgrBuilder::new(&mem_type, &mem_file_path)
             .map_err(StartMicroVmError::AddressManagerError)?;
         address_space_param.set_kvm_vm_fd(self.vm_fd.clone());
+        #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+        address_space_param.toggle_dirty_page_logging(!self.kvm_mem_attr_private());
         address_space_param.toggle_use_firmware(self.firmware_type.is_some());
         #[cfg(target_arch = "x86_64")]
         address_space_param.toggle_kvm_mem_attr_private(self.kvm_mem_attr_private());
