@@ -44,7 +44,12 @@ pub const KVM_MAP_GPA_RANGE_ENCRYPTED: u64 = 1 << 4;
 /// KVM arms the LAPIC timer against the guest TSC as it handles the write to
 /// MSR_IA32_TSCDEADLINE, so the deadline has to follow MSR_IA32_TSC or the
 /// timer is primed against a TSC the restore has not set up yet.
-const DEFERRED_MSRS: &[u32] = &[dbs_arch::msr::MSR_IA32_TSCDEADLINE];
+// APF completion interrupts must have their vector installed before APF enable,
+// including when the two MSRs were saved in different KVM-sized chunks.
+const DEFERRED_MSRS: &[u32] = &[
+    dbs_arch::msr::MSR_IA32_TSCDEADLINE,
+    dbs_arch::msr::MSR_KVM_ASYNC_PF_EN,
+];
 
 impl Vcpu {
     /// Constructs a new VCPU for `vm`.
@@ -585,6 +590,59 @@ mod tests {
             })
             .collect();
         Msrs::from_entries(&entries).unwrap()
+    }
+
+    #[test]
+    fn m2_snapshot_preserves_async_page_fault_interrupt_vector() {
+        skip_if_kvm_unaccessable!();
+        let (mut source, msrs) = create_vcpu_with_irqchip();
+        // A restored lazy mapping can issue APFs on its first KVM_RUN. Keeping
+        // ASYNC_PF_EN without this vector sends completion to interrupt zero.
+        const ASYNC_PF_INT: u32 = 0x4b56_4d06;
+        write_msr(&source, ASYNC_PF_INT, 0xf3);
+        let state = dbs_snapshot::Persist::save_state(&mut source, msrs.as_slice()).unwrap();
+        assert!(
+            state
+                .msrs
+                .iter()
+                .flat_map(|chunk| chunk.as_slice())
+                .any(|entry| entry.index == ASYNC_PF_INT && entry.data == 0xf3),
+            "snapshot dropped the APF completion vector"
+        );
+        let (mut restored, _) = create_vcpu_with_irqchip();
+        dbs_snapshot::Persist::restore_state(&mut restored, &state, ()).unwrap();
+        assert_eq!(read_msr(&restored, ASYNC_PF_INT), 0xf3);
+    }
+
+    #[test]
+    fn m2_apf_vector_is_restored_before_enable_across_chunks() {
+        const ASYNC_PF_INT: u32 = 0x4b56_4d06;
+        for chunks in [
+            vec![msr_chunk(&[
+                (dbs_arch::msr::MSR_KVM_ASYNC_PF_EN, 0x1009),
+                (ASYNC_PF_INT, 0xf3),
+            ])],
+            vec![
+                msr_chunk(&[(dbs_arch::msr::MSR_KVM_ASYNC_PF_EN, 0x1009)]),
+                msr_chunk(&[(ASYNC_PF_INT, 0xf3)]),
+            ],
+        ] {
+            let entries = planned_order(&chunks);
+            let vector = entries
+                .iter()
+                .position(|entry| entry.index == ASYNC_PF_INT)
+                .unwrap();
+            let enable = entries
+                .iter()
+                .position(|entry| entry.index == dbs_arch::msr::MSR_KVM_ASYNC_PF_EN)
+                .unwrap();
+            assert!(
+                vector < enable,
+                "APF enabled before its completion vector was installed"
+            );
+            assert_eq!(entries[enable].data, 0x1009);
+            assert_eq!(entries[vector].data, 0xf3);
+        }
     }
 
     fn planned_order(chunks: &[Msrs]) -> Vec<kvm_msr_entry> {
