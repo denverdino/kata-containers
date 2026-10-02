@@ -8,6 +8,19 @@ use serde_derive::{Deserialize, Serialize};
 use std::fs::File;
 use std::sync::Arc;
 
+/// Owned state output handle, compared by ownership identity like SnapshotFiles.
+#[derive(Clone, Debug)]
+pub struct SnapshotStateFile(
+    /// Descriptor retained until the request completes.
+    pub Arc<File>,
+);
+
+impl PartialEq for SnapshotStateFile {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// M1 conservatively requires the same KVM-supported CPU/MSR contract.
 #[derive(Deserialize, Serialize)]
 pub struct CpuRequirements {

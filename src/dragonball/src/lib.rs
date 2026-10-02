@@ -26,6 +26,7 @@ pub mod error;
 pub mod hypervisor_metrics;
 /// KVM operation context for virtual machines.
 pub mod kvm_context;
+pub mod memory_tracking;
 /// Metrics system.
 pub mod metric;
 /// Resource manager for virtual machines.

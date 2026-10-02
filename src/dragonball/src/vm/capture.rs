@@ -15,9 +15,12 @@ use std::time::Instant;
 
 type CaptureResult<T> = std::result::Result<T, CaptureError>;
 
+use crate::memory_tracking::FrozenMemoryMap;
+
 pub(super) struct VmCaptureSession {
     generation: u64,
     report: Option<CaptureReport>,
+    read_map: Option<FrozenMemoryMap>,
 }
 
 fn terminal(error: impl std::fmt::Display) -> CaptureError {
@@ -50,6 +53,158 @@ fn host_cpu_requirements(
 }
 
 impl Vm {
+    /// Export a generation-owned read map.
+    pub fn export_held_memory_map(
+        &mut self,
+        generation: u64,
+        deadline: Instant,
+    ) -> CaptureResult<FrozenMemoryMap> {
+        let layout = self
+            .held_report(generation, deadline)?
+            .memory_layout
+            .clone();
+        if self
+            .address_space
+            .capture_layout()
+            .map_err(|e| CaptureError::Export(e.into()))?
+            != layout
+        {
+            return Err(terminal("held memory layout changed"));
+        }
+        if let Some(map) = &self.capture_session.as_ref().unwrap().read_map {
+            return Ok(map.clone());
+        }
+        let map = self
+            .address_space
+            .frozen_memory_map(&self.vm_fd, generation)
+            .map_err(|e| CaptureError::Export(e.into()))?;
+        if Instant::now() >= deadline {
+            return Err(CaptureError::Rejected(
+                "memory export deadline expired; session remains held".into(),
+            ));
+        }
+        self.capture_session.as_mut().unwrap().read_map = Some(map.clone());
+        Ok(map)
+    }
+
+    /// Release the current generation's memory read pin.
+    pub fn release_held_memory_map(&mut self, generation: u64) -> CaptureResult<()> {
+        let session = self
+            .capture_session
+            .as_mut()
+            .ok_or_else(|| CaptureError::Rejected("no capture session".into()))?;
+        if generation == 0 || session.generation != generation || session.report.is_none() {
+            return Err(CaptureError::Rejected(
+                "wrong or unconfirmed generation".into(),
+            ));
+        }
+        session.read_map = None;
+        Ok(())
+    }
+
+    /// Export metadata without copying RAM.
+    pub fn export_held_state(
+        &mut self,
+        generation: u64,
+        deadline: Instant,
+        file: &File,
+    ) -> CaptureResult<()> {
+        let expected = self
+            .held_report(generation, deadline)?
+            .memory_layout
+            .clone();
+        let export = (|| -> std::result::Result<(), SnapshotError> {
+            if !file.metadata()?.is_file() {
+                return Err(SnapshotError::InvalidSnapshot(
+                    "state output must be a regular file".into(),
+                ));
+            }
+            self.validate_state_output(file)?;
+            let state = self.held_snapshot_metadata(&expected, deadline)?;
+            let mut output = file.try_clone()?;
+            output.seek(SeekFrom::Start(0))?;
+            output.set_len(0)?;
+            let mut writer = BufWriter::new(output);
+            serde_json::to_writer(&mut writer, &state)
+                .map_err(crate::snapshot::PersistError::from)?;
+            writer.flush()?;
+            file.sync_all()?;
+            if Instant::now() >= deadline {
+                return Err(SnapshotError::InvalidState(
+                    "export deadline expired; session remains held".into(),
+                ));
+            }
+            Ok(())
+        })();
+        export.map_err(CaptureError::Export)
+    }
+
+    fn held_snapshot_metadata(
+        &mut self,
+        expected: &crate::snapshot::capture::MemoryLayout,
+        deadline: Instant,
+    ) -> std::result::Result<MicrovmState, SnapshotError> {
+        if self.address_space.capture_layout()? != *expected {
+            return Err(SnapshotError::InvalidSnapshot(
+                "held memory layout changed".into(),
+            ));
+        }
+        let msrs = self.kvm.supported_msrs(0).map_err(SnapshotError::Kvm)?;
+        let states = self
+            .capture_cpu_manager(deadline)
+            .map_err(|e| SnapshotError::InvalidState(e.to_string()))?
+            .capture_save(msrs.as_slice(), deadline)?;
+        let mut state = self.snapshot_metadata_paused(states)?;
+        #[cfg(feature = "virtio-vsock")]
+        {
+            state.device_states.vsock = None;
+        }
+        #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
+        {
+            state.device_states.fs = None;
+        }
+        state.capture_cpu = Some(CpuRequirements {
+            cpuid: host_cpu_requirements(&self.kvm)?,
+            msr_indices: msrs.as_slice().to_vec(),
+        });
+        state.memory_state = Some(crate::address_space_manager::GuestMemoryState {
+            regions: expected
+                .regions
+                .iter()
+                .map(
+                    |region| crate::address_space_manager::GuestMemoryRegionState {
+                        guest_addr: region.guest_addr,
+                        size: region.size,
+                        file_offset: region.file_offset,
+                    },
+                )
+                .collect(),
+        });
+        Ok(state)
+    }
+
+    fn validate_state_output(&self, file: &File) -> std::result::Result<(), SnapshotError> {
+        use vm_memory::GuestMemory;
+        if let Some(source) = &self.capture_source {
+            if same_file(file, &source.state)? || same_file(file, &source.memory)? {
+                return Err(SnapshotError::InvalidSnapshot(
+                    "output aliases live snapshot backing".into(),
+                ));
+            }
+        }
+        if let Some(memory) = self.address_space.vm_memory() {
+            for region in memory.iter() {
+                if let Some(backing) = region.file_offset() {
+                    if same_file(file, backing.file())? {
+                        return Err(SnapshotError::InvalidSnapshot(
+                            "output aliases live RAM mapping".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn capture_is_active(&self) -> bool {
         self.capture_session.is_some()
     }
@@ -124,6 +279,7 @@ impl Vm {
         self.capture_session = Some(VmCaptureSession {
             generation,
             report: None,
+            read_map: None,
         });
         let vcpu_acks = self
             .capture_cpu_manager(deadline)?
@@ -181,6 +337,11 @@ impl Vm {
         resume: bool,
     ) -> CaptureResult<()> {
         self.held_report(generation, deadline)?;
+        if self.capture_session.as_ref().unwrap().read_map.is_some() {
+            return Err(CaptureError::Rejected(
+                "memory readers still pin this generation".into(),
+            ));
+        }
         // Mark unconfirmed before release; any partial release requires teardown.
         self.capture_session.as_mut().unwrap().report = None;
         self.device_manager
@@ -216,38 +377,10 @@ impl Vm {
                     "outputs must be distinct regular files".into(),
                 ));
             }
-            if let Some(source) = &self.capture_source {
-                for output in [&files.state, &files.memory] {
-                    if same_file(output, &source.state)? || same_file(output, &source.memory)? {
-                        return Err(SnapshotError::InvalidSnapshot(
-                            "output aliases a live snapshot backing".into(),
-                        ));
-                    }
-                }
+            for output in [&files.state, &files.memory] {
+                self.validate_state_output(output)?;
             }
-            if self.address_space.capture_layout()? != expected {
-                return Err(SnapshotError::InvalidSnapshot(
-                    "held memory layout changed".into(),
-                ));
-            }
-            let msrs = self.kvm.supported_msrs(0).map_err(SnapshotError::Kvm)?;
-            let states = self
-                .capture_cpu_manager(deadline)
-                .map_err(|e| SnapshotError::InvalidState(e.to_string()))?
-                .capture_save(msrs.as_slice(), deadline)?;
-            let mut state = self.snapshot_metadata_paused(states)?;
-            #[cfg(feature = "virtio-vsock")]
-            {
-                state.device_states.vsock = None;
-            }
-            #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
-            {
-                state.device_states.fs = None;
-            }
-            state.capture_cpu = Some(CpuRequirements {
-                cpuid: host_cpu_requirements(&self.kvm)?,
-                msr_indices: msrs.as_slice().to_vec(),
-            });
+            let mut state = self.held_snapshot_metadata(&expected, deadline)?;
             let mut memory = files.memory.try_clone()?;
             state.memory_state = Some(self.address_space.save_state(&mut memory)?);
             let mut output = files.state.try_clone()?;
@@ -292,6 +425,7 @@ impl Vm {
         self.capture_session = Some(VmCaptureSession {
             generation,
             report: None,
+            read_map: None,
         });
         self.capture_source = Some(files.clone());
         let restored = (|| -> std::result::Result<(), StartMicroVmError> {
@@ -600,6 +734,256 @@ mod tests {
 
     fn paused_counter_vm() -> (Vm, RealVcpuExecution) {
         paused_counter_vm_with_disk(None)
+    }
+
+    #[test]
+    fn m2_cold_export_covers_complete_layout() {
+        let (mut vm, _real) = paused_counter_vm();
+        let report = vm.begin_capture(1, deadline()).unwrap();
+        let map = vm.export_held_memory_map(1, deadline()).unwrap();
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        assert_eq!(map.regions.len(), report.memory_layout.regions.len());
+        assert_eq!(
+            map.changed_ranges,
+            vec![crate::memory_tracking::MemoryRange {
+                image_offset: 0,
+                length: 16 << 20,
+            }]
+        );
+    }
+
+    #[test]
+    fn m2_read_pin_blocks_release_and_stale_map() {
+        let (mut vm, real) = paused_counter_vm();
+        vm.begin_capture(1, deadline()).unwrap();
+        let map = vm.export_held_memory_map(1, deadline()).unwrap();
+        let result = vm.end_capture(1, deadline(), true);
+        if result.is_ok() {
+            vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+            panic!("read pin must prevent resume");
+        }
+        assert_eq!(real.run_count(), 0);
+        assert_eq!(
+            vm.address_space
+                .vm_memory()
+                .unwrap()
+                .read_obj::<u16>(GuestAddress(0x2000))
+                .unwrap(),
+            0,
+            "rejected resume must leave RAM unchanged"
+        );
+        assert_eq!(vm.export_held_memory_map(1, deadline()).unwrap(), map);
+        assert!(vm.release_held_memory_map(2).is_err());
+        assert!(vm.export_held_memory_map(2, deadline()).is_err());
+        vm.release_held_memory_map(1).unwrap();
+        vm.end_capture(1, deadline(), false).unwrap();
+        assert!(vm.export_held_memory_map(1, deadline()).is_err());
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+    }
+
+    fn with_loaded_counter(test: impl FnOnce(&mut Vm, &SnapshotFiles)) {
+        let (mut source, _real) = paused_counter_vm();
+        let config = source.vm_config.clone();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        let input = files(&state, &memory);
+        source.begin_capture(1, deadline()).unwrap();
+        source.export_held_snapshot(1, deadline(), &input).unwrap();
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        drop(source);
+        let epoll = EpollManager::default();
+        let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+            epoll.clone(),
+        )));
+        let mut events = EventManager::new(&vmm, epoll).unwrap();
+        let mut vmm = vmm.lock().unwrap();
+        let target = vmm.get_vm_mut().unwrap();
+        let _real = RealVcpuExecution::new(target.vm_fd.clone());
+        target.set_vm_config(config);
+        target
+            .load_snapshot_held(&mut events, Default::default(), &input, 1, deadline())
+            .unwrap();
+        test(target, &input);
+        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+    }
+
+    #[test]
+    fn m2_cpu_dirty_survives_capture_and_failed_export() {
+        with_loaded_counter(|vm, input| {
+            assert!(vm
+                .export_held_memory_map(1, deadline())
+                .unwrap()
+                .changed_ranges
+                .is_empty());
+            vm.release_held_memory_map(1).unwrap();
+            vm.end_capture(1, deadline(), true).unwrap();
+            let ram = vm.address_space.vm_memory().unwrap();
+            let limit = deadline();
+            while ram.read_obj::<u16>(GuestAddress(0x2000)).unwrap() == 0 && Instant::now() < limit
+            {
+                std::thread::yield_now();
+            }
+            vm.begin_capture(2, deadline()).unwrap();
+            assert_ne!(ram.read_obj::<u16>(GuestAddress(0x2000)).unwrap(), 0);
+            let map = vm.export_held_memory_map(2, deadline()).unwrap();
+            assert!(
+                map.changed_ranges
+                    .iter()
+                    .any(|range| range.image_offset <= 0x2000
+                        && range.image_offset + range.length > 0x2000),
+                "real KVM write must be dirty"
+            );
+            assert!(
+                map.changed_ranges
+                    .iter()
+                    .map(|range| range.length)
+                    .sum::<u64>()
+                    < 16 << 20
+            );
+            assert!(
+                vm.export_held_state(2, deadline(), &input.memory).is_err(),
+                "live backing alias rejected"
+            );
+            let readonly = TempFile::new().unwrap();
+            assert!(vm
+                .export_held_state(2, deadline(), &File::open(readonly.as_path()).unwrap())
+                .is_err());
+            assert_eq!(vm.export_held_memory_map(2, deadline()).unwrap(), map);
+            vm.release_held_memory_map(2).unwrap();
+            vm.end_capture(2, deadline(), false).unwrap();
+            vm.begin_capture(3, deadline()).unwrap();
+            let retry = vm.export_held_memory_map(3, deadline()).unwrap();
+            assert_eq!(
+                retry.changed_ranges, map.changed_ranges,
+                "capture must not reset fixed-base history"
+            );
+            let output = TempFile::new().unwrap();
+            vm.export_held_state(3, deadline(), output.as_file())
+                .unwrap();
+            output.as_file().seek(SeekFrom::Start(0)).unwrap();
+            let state: MicrovmState = serde_json::from_reader(output.as_file()).unwrap();
+            assert_eq!(state.memory_state.unwrap().regions[0].size, 16 << 20);
+            vm.release_held_memory_map(3).unwrap();
+            vm.end_capture(3, deadline(), false).unwrap();
+        });
+    }
+
+    #[test]
+    fn m2_state_only_rejects_cold_live_backing_alias() {
+        let (mut vm, _real) = paused_counter_vm();
+        vm.begin_capture(1, deadline()).unwrap();
+        let memory = vm.address_space.vm_memory().unwrap();
+        let backing = memory
+            .iter()
+            .next()
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .try_clone()
+            .unwrap();
+        let before = backing.metadata().unwrap().len();
+        let result = vm.export_held_state(1, deadline(), &backing);
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        assert!(result.is_err(), "cold RAM file is also live backing");
+        assert_eq!(backing.metadata().unwrap().len(), before);
+    }
+
+    #[test]
+    fn m2_full_export_rejects_cold_live_backing_alias() {
+        let (mut vm, _real) = paused_counter_vm();
+        vm.begin_capture(1, deadline()).unwrap();
+        let ram = vm.address_space.vm_memory().unwrap();
+        let backing = ram
+            .iter()
+            .next()
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .try_clone()
+            .unwrap();
+        let before = backing.metadata().unwrap().len();
+        let output = SnapshotFiles::new(backing, TempFile::new().unwrap().into_file());
+        let result = vm.export_held_snapshot(1, deadline(), &output);
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        assert!(
+            result.is_err(),
+            "full export must not truncate cold RAM through its state output"
+        );
+        assert_eq!(output.state.metadata().unwrap().len(), before);
+    }
+
+    #[test]
+    fn m2_actions_preserve_read_pin_and_owned_state_output() {
+        use crate::api::v1::{VmmAction, VmmData, VmmService};
+        use crate::snapshot::capture::SnapshotStateFile;
+        use crossbeam_channel::unbounded as channel;
+        let (vm, _real) = paused_counter_vm();
+        let epoll = EpollManager::default();
+        let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+            epoll.clone(),
+        )));
+        let mut events = EventManager::new(&vmm, epoll).unwrap();
+        let mut vmm = vmm.lock().unwrap();
+        *vmm.get_vm_mut().unwrap() = vm;
+        let (request_tx, request_rx) = channel();
+        let (response_tx, response_rx) = channel();
+        let mut service = VmmService::new(request_rx, response_tx);
+        let mut call = |action| {
+            request_tx.send(Box::new(action)).unwrap();
+            service.run_vmm_action(&mut vmm, &mut events).unwrap();
+            *response_rx.recv().unwrap()
+        };
+        assert!(matches!(
+            call(VmmAction::BeginCapture {
+                generation: 1,
+                deadline: deadline()
+            }),
+            Ok(VmmData::CaptureReport(_))
+        ));
+        assert!(matches!(
+            call(VmmAction::ExportHeldMemoryMap {
+                generation: 1,
+                deadline: deadline()
+            }),
+            Ok(VmmData::FrozenMemoryMap(_))
+        ));
+        assert!(call(VmmAction::EndCapture {
+            generation: 1,
+            deadline: deadline(),
+            resume: true
+        })
+        .is_err());
+        let output = Arc::new(TempFile::new().unwrap().into_file());
+        assert!(matches!(
+            call(VmmAction::ExportHeldState {
+                generation: 1,
+                deadline: deadline(),
+                state_file: SnapshotStateFile(output.clone())
+            }),
+            Ok(VmmData::Empty)
+        ));
+        assert!(output.metadata().unwrap().len() > 0);
+        assert!(call(VmmAction::ReleaseHeldMemoryMap { generation: 2 }).is_err());
+        assert!(matches!(
+            call(VmmAction::ReleaseHeldMemoryMap { generation: 1 }),
+            Ok(VmmData::Empty)
+        ));
+        assert!(matches!(
+            call(VmmAction::EndCapture {
+                generation: 1,
+                deadline: deadline(),
+                resume: false
+            }),
+            Ok(VmmData::Empty)
+        ));
+        vmm.get_vm_mut()
+            .unwrap()
+            .vcpu_manager()
+            .unwrap()
+            .exit_all_vcpus()
+            .unwrap();
     }
 
     fn configure_disk(vm: &mut Vm, path: &std::path::Path) {

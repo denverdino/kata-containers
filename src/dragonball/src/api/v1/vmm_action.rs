@@ -180,6 +180,30 @@ pub enum VmmActionError {
 /// bits of information (ids, paths, etc.).
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmmAction {
+    /// Export only CPU/device metadata and packed RAM layout.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    ExportHeldState {
+        /// Confirmed generation.
+        generation: u64,
+        /// Export deadline.
+        deadline: std::time::Instant,
+        /// Owned open output; no pathname is reopened.
+        state_file: crate::snapshot::capture::SnapshotStateFile,
+    },
+    /// Export cumulative changed ranges and pin this held generation.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    ExportHeldMemoryMap {
+        /// Confirmed generation.
+        generation: u64,
+        /// Export deadline.
+        deadline: std::time::Instant,
+    },
+    /// Confirm that all external reads of this generation have finished.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    ReleaseHeldMemoryMap {
+        /// Generation whose read pin is released.
+        generation: u64,
+    },
     /// Confirm CPU and complete device holds for a new generation.
     #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
     BeginCapture {
@@ -367,6 +391,9 @@ pub enum VmmAction {
 /// empty, when no data needs to be sent, or an internal VMM structure.
 #[derive(Debug)]
 pub enum VmmData {
+    /// Transient generation-pinned memory read map.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    FrozenMemoryMap(crate::memory_tracking::FrozenMemoryMap),
     /// Complete current-generation CPU/device and memory mapping proof.
     #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
     CaptureReport(crate::snapshot::capture::CaptureReport),
@@ -434,6 +461,9 @@ impl VmmService {
                 VmmAction::BeginCapture { .. }
                     | VmmAction::EndCapture { .. }
                     | VmmAction::ExportHeldSnapshot { .. }
+                    | VmmAction::ExportHeldState { .. }
+                    | VmmAction::ExportHeldMemoryMap { .. }
+                    | VmmAction::ReleaseHeldMemoryMap { .. }
                     | VmmAction::LoadSnapshotHeld { .. }
                     | VmmAction::ShutdownMicroVm
                     | VmmAction::GetVmConfiguration
@@ -448,6 +478,40 @@ impl VmmService {
         }
 
         let response = match request {
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::ExportHeldState {
+                generation,
+                deadline,
+                state_file,
+            } => vmm
+                .get_vm_mut()
+                .ok_or(VmmActionError::InvalidVMID)
+                .and_then(|vm| {
+                    vm.export_held_state(generation, deadline, &state_file.0)
+                        .map(|_| VmmData::Empty)
+                        .map_err(VmmActionError::Capture)
+                }),
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::ExportHeldMemoryMap {
+                generation,
+                deadline,
+            } => vmm
+                .get_vm_mut()
+                .ok_or(VmmActionError::InvalidVMID)
+                .and_then(|vm| {
+                    vm.export_held_memory_map(generation, deadline)
+                        .map(VmmData::FrozenMemoryMap)
+                        .map_err(VmmActionError::Capture)
+                }),
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::ReleaseHeldMemoryMap { generation } => vmm
+                .get_vm_mut()
+                .ok_or(VmmActionError::InvalidVMID)
+                .and_then(|vm| {
+                    vm.release_held_memory_map(generation)
+                        .map(|_| VmmData::Empty)
+                        .map_err(VmmActionError::Capture)
+                }),
             #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
             VmmAction::BeginCapture {
                 generation,

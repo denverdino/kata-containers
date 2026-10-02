@@ -370,6 +370,8 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
 
 /// Struct to manage virtual machine's physical address space.
 pub struct AddressSpaceMgr {
+    memory_tracker: crate::memory_tracking::MemoryTracker,
+    dirty_logging: bool,
     address_space: Option<AddressSpace>,
     vm_as: Option<GuestAddressSpaceImpl>,
     base_to_slot: Arc<Mutex<HashMap<u64, u32>>>,
@@ -556,6 +558,16 @@ impl AddressSpaceMgr {
         );
         self.address_space = Some(AddressSpace::from_regions(regions, layout));
 
+        let total = self
+            .vm_memory()
+            .unwrap()
+            .iter()
+            .map(|region| region.len())
+            .sum();
+        self.memory_tracker =
+            crate::memory_tracking::MemoryTracker::new(total, param.snapshot.is_some());
+        self.dirty_logging = param.dirty_page_logging;
+
         Ok(())
     }
 
@@ -624,7 +636,11 @@ impl AddressSpaceMgr {
             let host_addr = mmap_reg
                 .get_host_address(MemoryRegionAddress(0))
                 .map_err(|_e| AddressManagerError::InvalidOperation)?;
-            let mut flags = 0u32;
+            let mut flags = if param.dirty_page_logging {
+                kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES
+            } else {
+                0
+            };
 
             #[cfg(not(target_arch = "x86_64"))]
             let kvm_guest_memfd = false;
@@ -933,7 +949,67 @@ impl AddressSpaceMgr {
         })
     }
 
-    /// get numa nodes infos from address space manager.
+    /// Merge KVM pages into the fixed-base history and classify current zero pages.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    pub(crate) fn frozen_memory_map(
+        &mut self,
+        vmfd: &VmFd,
+        generation: u64,
+    ) -> Result<crate::memory_tracking::FrozenMemoryMap> {
+        use crate::memory_tracking::{push_page, FrozenMemoryMap, FrozenMemoryRegion};
+        use vm_memory::Bytes;
+        if !self.dirty_logging || unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != 4096 {
+            return Err(AddressManagerError::InvalidOperation);
+        }
+        let layout = self.capture_layout()?;
+        for region in &layout.regions {
+            let bitmap = vmfd
+                .get_dirty_log(region.kvm_slot, region.size as usize)
+                .map_err(|e| {
+                    AddressManagerError::SnapshotFile(std::io::Error::from_raw_os_error(e.errno()))
+                })?;
+            // KVM may clear bits as it returns them: persist each slot immediately,
+            // even if a later slot, page read or output operation fails.
+            self.memory_tracker
+                .merge(region.file_offset, region.size, &bitmap);
+        }
+        let memory = self
+            .vm_memory()
+            .ok_or(AddressManagerError::GuestMemoryNotInitialized)?;
+        let mut map = FrozenMemoryMap {
+            generation,
+            page_size: 4096,
+            regions: Vec::new(),
+            changed_ranges: Vec::new(),
+            zero_ranges: Vec::new(),
+        };
+        let mut page = [0u8; 4096];
+        for region in &layout.regions {
+            map.regions.push(FrozenMemoryRegion {
+                guest_base: region.guest_addr,
+                host_base: region.host_addr,
+                image_offset: region.file_offset,
+                length: region.size,
+            });
+            for offset in (0..region.size).step_by(4096) {
+                let image_offset = region.file_offset + offset;
+                if self.memory_tracker.dirty(image_offset) {
+                    push_page(&mut map.changed_ranges, image_offset);
+                    memory
+                        .read_slice(&mut page, GuestAddress(region.guest_addr + offset))
+                        .map_err(|e| {
+                            AddressManagerError::AccessGuestMemory(region.guest_addr + offset, e)
+                        })?;
+                    if page.iter().all(|byte| *byte == 0) {
+                        push_page(&mut map.zero_ranges, image_offset);
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// Get NUMA node information from the address space manager.
     pub fn get_numa_nodes(&self) -> &BTreeMap<u32, NumaNode> {
         &self.numa_nodes
     }
@@ -1143,6 +1219,8 @@ impl Default for AddressSpaceMgr {
     /// Create a new empty AddressSpaceMgr
     fn default() -> Self {
         AddressSpaceMgr {
+            memory_tracker: Default::default(),
+            dirty_logging: false,
             address_space: None,
             vm_as: None,
             base_to_slot: Arc::new(Mutex::new(HashMap::new())),
@@ -1474,6 +1552,161 @@ mod tests {
         let high = ram.iter().nth(1).unwrap();
         assert_eq!(high.file_offset().unwrap().start(), 3u64 << 30);
         assert_eq!(high.flags() & libc::MAP_SHARED, 0);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    fn m2_real_kvm_dirty_crosses_gpa_hole_and_reclassifies_zero() {
+        use std::os::unix::fs::FileExt;
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(8u64 << 30).unwrap();
+        // Long-mode identity mappings for low RAM and RAM above the PCI hole.
+        for (offset, entry) in [
+            (0x9000, 0xa003u64),
+            (0xa000, 0xb003),
+            (0xa020, 0xc003),
+            (0xb000, 0x83),
+            (0xc000, (4u64 << 30) | 0x83),
+        ] {
+            file.write_all_at(&entry.to_le_bytes(), offset).unwrap();
+        }
+        let mut code = vec![0x48, 0xb8]; // movabs rax, high page; mov byte [rax], 0x5a
+        code.extend_from_slice(&((4u64 << 30) + 0x2000).to_le_bytes());
+        code.extend_from_slice(&[0xc6, 0x00, 0x5a, 0x48, 0xb8]);
+        code.extend_from_slice(&0x2000u64.to_le_bytes());
+        code.extend_from_slice(&[0xc6, 0x00, 0x6b, 0xf4]);
+        file.write_all_at(&code, 0x1000).unwrap();
+        let state = GuestMemoryState {
+            regions: vec![
+                GuestMemoryRegionState {
+                    guest_addr: 0,
+                    size: 3u64 << 30,
+                    file_offset: 0,
+                },
+                GuestMemoryRegionState {
+                    guest_addr: 4u64 << 30,
+                    size: 5u64 << 30,
+                    file_offset: 3u64 << 30,
+                },
+            ],
+        };
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm = Arc::new(kvm.create_vm().unwrap());
+        let mut builder = AddressSpaceMgrBuilder::new("shmem", "").unwrap();
+        builder.set_kvm_vm_fd(vm.clone());
+        builder.toggle_dirty_page_logging(true);
+        let mut memory = builder
+            .build_from_snapshot(
+                &ResourceManager::new(None),
+                &[NumaRegionInfo {
+                    size: 8192,
+                    host_numa_node_id: None,
+                    guest_numa_node_id: Some(0),
+                    vcpu_ids: vec![0],
+                }],
+                &state,
+                &file,
+            )
+            .unwrap();
+        assert!(memory
+            .frozen_memory_map(&vm, 1)
+            .unwrap()
+            .changed_ranges
+            .is_empty());
+        let mut cpu = vm.create_vcpu(0).unwrap();
+        cpu.set_cpuid2(
+            &kvm.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut regs = cpu.get_sregs().unwrap();
+        regs.cr3 = 0x9000;
+        regs.cr4 = 0x20;
+        regs.cr0 |= 0x80000001;
+        regs.efer = 0x500;
+        regs.cs = kvm_bindings::kvm_segment {
+            base: 0,
+            limit: u32::MAX,
+            selector: 8,
+            type_: 11,
+            present: 1,
+            s: 1,
+            l: 1,
+            g: 1,
+            ..Default::default()
+        };
+        regs.ds = kvm_bindings::kvm_segment {
+            base: 0,
+            limit: u32::MAX,
+            selector: 16,
+            type_: 3,
+            present: 1,
+            s: 1,
+            db: 1,
+            g: 1,
+            ..Default::default()
+        };
+        regs.es = regs.ds;
+        regs.ss = regs.ds;
+        cpu.set_sregs(&regs).unwrap();
+        cpu.set_regs(&kvm_bindings::kvm_regs {
+            rip: 0x1000,
+            rflags: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(cpu.run().unwrap(), kvm_ioctls::VcpuExit::Hlt));
+        let ram = memory.vm_memory().unwrap();
+        assert_eq!(ram.read_obj::<u8>(GuestAddress(0x2000)).unwrap(), 0x6b);
+        assert_eq!(
+            ram.read_obj::<u8>(GuestAddress((4u64 << 30) + 0x2000))
+                .unwrap(),
+            0x5a
+        );
+        let high_slot = memory
+            .base_to_slot
+            .lock()
+            .unwrap()
+            .insert(4u64 << 30, u32::MAX)
+            .unwrap();
+        assert!(
+            memory.frozen_memory_map(&vm, 2).is_err(),
+            "later slot failure must not discard the already-read low bitmap"
+        );
+        memory
+            .base_to_slot
+            .lock()
+            .unwrap()
+            .insert(4u64 << 30, high_slot);
+        let first = memory.frozen_memory_map(&vm, 2).unwrap();
+        let contains = |ranges: &[crate::memory_tracking::MemoryRange], offset| {
+            ranges.iter().any(|range| {
+                range.image_offset <= offset && range.image_offset + range.length > offset
+            })
+        };
+        assert!(contains(&first.changed_ranges, 0x2000));
+        assert!(contains(&first.changed_ranges, (3u64 << 30) + 0x2000));
+        assert!(
+            first
+                .changed_ranges
+                .iter()
+                .map(|range| range.length)
+                .sum::<u64>()
+                < 64 << 10
+        );
+        ram.write_obj(0u8, GuestAddress((4u64 << 30) + 0x2000))
+            .unwrap();
+        let zero = memory.frozen_memory_map(&vm, 3).unwrap();
+        assert_eq!(zero.changed_ranges, first.changed_ranges);
+        assert!(contains(&zero.zero_ranges, (3u64 << 30) + 0x2000));
+        ram.write_obj(0x91u8, GuestAddress((4u64 << 30) + 0x2000))
+            .unwrap();
+        let rewritten = memory.frozen_memory_map(&vm, 4).unwrap();
+        assert!(!contains(&rewritten.zero_ranges, (3u64 << 30) + 0x2000));
+        let mut lower = [0];
+        file.read_exact_at(&mut lower, (3u64 << 30) + 0x2000)
+            .unwrap();
+        assert_eq!(lower, [0]);
     }
 
     #[test]
