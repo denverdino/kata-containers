@@ -37,6 +37,8 @@ pub struct SnapshotFiles {
     pub state: Arc<File>,
     /// Packed RAM file. The caller must not mutate it during an operation.
     pub memory: Arc<File>,
+    /// Checked replacements for explicitly reserved slots; never serialized into VM state.
+    pub block_bindings: Vec<crate::device_manager::blk_dev_mgr::RestoreBlockBinding>,
 }
 
 impl SnapshotFiles {
@@ -45,13 +47,16 @@ impl SnapshotFiles {
         Self {
             state: Arc::new(state),
             memory: Arc::new(memory),
+            block_bindings: Vec::new(),
         }
     }
 }
 
 impl PartialEq for SnapshotFiles {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state) && Arc::ptr_eq(&self.memory, &other.memory)
+        Arc::ptr_eq(&self.state, &other.state)
+            && Arc::ptr_eq(&self.memory, &other.memory)
+            && self.block_bindings == other.block_bindings
     }
 }
 
