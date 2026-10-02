@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -209,6 +210,55 @@ pub enum AddressManagerError {
 
 type Result<T> = std::result::Result<T, AddressManagerError>;
 
+/// Supported sources of a restored RAM image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBackingKind {
+    /// An ordinary file, whose length is its capacity.
+    RegularFile,
+    /// A block device, whose capacity is reported by BLKGETSIZE64.
+    BlockDevice,
+}
+
+/// Validated backing type and byte capacity, obtained from an open descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBackingInfo {
+    /// Source type.
+    pub kind: MemoryBackingKind,
+    /// Available bytes.
+    pub capacity: u64,
+}
+
+nix::ioctl_read!(
+    /// Query the byte capacity of an open Linux block device.
+    ///
+    /// # Safety
+    /// The output pointer must reference a writable u64.
+    memory_blkgetsize64, 0x12, 114, u64
+);
+
+/// Inspect the already opened backing; never infer block capacity from st_size.
+pub fn inspect_memory_backing(file: &File) -> Result<MemoryBackingInfo> {
+    let metadata = file.metadata().map_err(AddressManagerError::SnapshotFile)?;
+    if metadata.is_file() {
+        return Ok(MemoryBackingInfo {
+            kind: MemoryBackingKind::RegularFile,
+            capacity: metadata.len(),
+        });
+    }
+    if !metadata.file_type().is_block_device() {
+        return Err(AddressManagerError::InvalidOperation);
+    }
+    let mut capacity = 0u64;
+    // SAFETY: the descriptor remains open and the ioctl writes exactly one u64.
+    unsafe { memory_blkgetsize64(file.as_raw_fd(), &mut capacity) }.map_err(|error| {
+        AddressManagerError::SnapshotFile(std::io::Error::from_raw_os_error(error as i32))
+    })?;
+    Ok(MemoryBackingInfo {
+        kind: MemoryBackingKind::BlockDevice,
+        capacity,
+    })
+}
+
 /// Parameters to configure address space creation operations.
 pub struct AddressSpaceMgrBuilder<'a> {
     mem_type: &'a str,
@@ -219,6 +269,7 @@ pub struct AddressSpaceMgrBuilder<'a> {
     dirty_page_logging: bool,
     vmfd: Option<Arc<VmFd>>,
     use_firmware: bool,
+    snapshot: Option<(&'a GuestMemoryState, &'a File)>,
     #[cfg(target_arch = "x86_64")]
     kvm_mem_attr_private: bool,
 }
@@ -238,6 +289,7 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
             dirty_page_logging: false,
             vmfd: None,
             use_firmware: false,
+            snapshot: None,
             #[cfg(target_arch = "x86_64")]
             kvm_mem_attr_private: false,
         })
@@ -293,6 +345,18 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
         Ok(mgr)
     }
 
+    /// Build a restored address space before passing it to vCPUs or devices.
+    pub fn build_from_snapshot(
+        mut self,
+        res_mgr: &ResourceManager,
+        numa_region_infos: &[NumaRegionInfo],
+        state: &'a GuestMemoryState,
+        file: &'a File,
+    ) -> Result<AddressSpaceMgr> {
+        self.snapshot = Some((state, file));
+        self.build(res_mgr, numa_region_infos)
+    }
+
     fn get_next_mem_file(&mut self) -> String {
         if self.mem_suffix {
             let path = format!("{}{}", self.mem_file, self.mem_index);
@@ -340,6 +404,19 @@ impl AddressSpaceMgr {
         numa_region_infos: &[NumaRegionInfo],
         mut param: AddressSpaceMgrBuilder,
     ) -> Result<()> {
+        if param.snapshot.is_some() {
+            if param.mem_prealloc
+                || param.mem_type != "shmem"
+                || param.use_firmware
+                || unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != 4096
+            {
+                return Err(AddressManagerError::InvalidOperation);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if param.kvm_mem_attr_private {
+                return Err(AddressManagerError::InvalidOperation);
+            }
+        }
         let mut regions = Vec::new();
         let mut start_addr = dbs_boot::layout::GUEST_MEM_START;
 
@@ -401,6 +478,47 @@ impl AddressSpaceMgr {
             regions.push(region);
         }
 
+        // Validate every region before any mapping, KVM slot or worker exists.
+        if let Some((state, file)) = param.snapshot {
+            if state.regions.len() != regions.len() {
+                return Err(AddressManagerError::SnapshotRegionCountMismatch {
+                    expected: regions.len(),
+                    actual: state.regions.len(),
+                });
+            }
+            let capacity = inspect_memory_backing(file)?.capacity;
+            let mut offset = 0u64;
+            for (region, saved) in regions.iter_mut().zip(&state.regions) {
+                if saved.guest_addr != region.start_addr().raw_value()
+                    || saved.size != region.len()
+                    || saved.file_offset != offset
+                    || saved.size == 0
+                    || saved.size % 4096 != 0
+                    || saved.guest_addr % 4096 != 0
+                    || saved.guest_addr.checked_add(saved.size).is_none()
+                {
+                    return Err(AddressManagerError::SnapshotLayoutMismatch(
+                        saved.guest_addr,
+                    ));
+                }
+                offset = offset.checked_add(saved.size).ok_or(
+                    AddressManagerError::SnapshotLayoutMismatch(saved.guest_addr),
+                )?;
+                if offset > capacity {
+                    return Err(AddressManagerError::SnapshotFileTooSmall {
+                        guest_addr: saved.guest_addr,
+                        needed: offset,
+                        file_len: capacity,
+                    });
+                }
+                Arc::make_mut(region).set_file_offset(Some(FileOffset::new(
+                    file.try_clone()
+                        .map_err(AddressManagerError::SnapshotFile)?,
+                    saved.file_offset,
+                )));
+            }
+        }
+
         // Create GuestMemory object
         let mut vm_memory = GuestMemoryMmap::new();
         for reg in regions.iter() {
@@ -449,17 +567,30 @@ impl AddressSpaceMgr {
         info: &NumaRegionInfo,
         param: &mut AddressSpaceMgrBuilder,
     ) -> Result<Arc<AddressSpaceRegion>> {
-        let mem_file_path = param.get_next_mem_file();
-        let region = AddressSpaceRegion::create_default_memory_region(
-            GuestAddress(start_addr),
-            size_bytes,
-            info.host_numa_node_id,
-            param.mem_type,
-            &mem_file_path,
-            param.mem_prealloc,
-            false,
-        )
-        .map_err(AddressManagerError::CreateAddressSpaceRegion)?;
+        let region = if param.snapshot.is_some() {
+            AddressSpaceRegion::build(
+                AddressSpaceRegionType::DefaultMemory,
+                GuestAddress(start_addr),
+                size_bytes,
+                info.host_numa_node_id,
+                None,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                false,
+            )
+        } else {
+            let mem_file_path = param.get_next_mem_file();
+            AddressSpaceRegion::create_default_memory_region(
+                GuestAddress(start_addr),
+                size_bytes,
+                info.host_numa_node_id,
+                param.mem_type,
+                &mem_file_path,
+                param.mem_prealloc,
+                false,
+            )
+            .map_err(AddressManagerError::CreateAddressSpaceRegion)?
+        };
         let region = Arc::new(region);
 
         self.insert_into_numa_nodes(
@@ -940,10 +1071,7 @@ impl<'a> dbs_snapshot::Persist<'a> for AddressSpaceMgr {
         // fresh address space describes every region expected from the current
         // VM configuration; walking both lists in guest-address order catches
         // omitted, extra, reordered and malformed snapshot regions.
-        let file_len = file
-            .metadata()
-            .map_err(AddressManagerError::SnapshotFile)?
-            .len();
+        let file_len = inspect_memory_backing(file)?.capacity;
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page_size <= 0 {
             return Err(AddressManagerError::InvalidOperation);
@@ -1035,6 +1163,318 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+
+    // A restore must replace both the mapping and its metadata. Otherwise
+    // balloon/device consumers incorrectly treat file-backed pages as anonymous.
+    #[test]
+    fn m2_private_mapping_metadata_and_cow() {
+        use std::os::unix::fs::FileExt;
+        let create = |state: &GuestMemoryState, file: &File| {
+            AddressSpaceMgrBuilder::new("shmem", "")
+                .unwrap()
+                .build_from_snapshot(
+                    &ResourceManager::new(None),
+                    &[NumaRegionInfo {
+                        size: 1,
+                        host_numa_node_id: None,
+                        guest_numa_node_id: Some(0),
+                        vcpu_ids: vec![0],
+                    }],
+                    state,
+                    file,
+                )
+                .unwrap()
+        };
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(1 << 20).unwrap();
+        backing.as_file().write_all_at(&[0x51; 4096], 0).unwrap();
+        let file = File::open(backing.as_path()).unwrap();
+        let state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                guest_addr: GUEST_MEM_START,
+                size: 1 << 20,
+                file_offset: 0,
+            }],
+        };
+        let first = create(&state, &file);
+        let second = create(&state, &file);
+        let first_mem = first.vm_memory().unwrap();
+        let second_mem = second.vm_memory().unwrap();
+        let region = first_mem.iter().next().unwrap();
+        assert!(
+            region.file_offset().is_some(),
+            "restored region must own its actual backing"
+        );
+        assert_eq!(region.flags() & libc::MAP_SHARED, 0);
+        assert_ne!(region.flags() & libc::MAP_PRIVATE, 0);
+        first_mem
+            .write_obj(0x72u8, GuestAddress(GUEST_MEM_START))
+            .unwrap();
+        assert_eq!(
+            second_mem
+                .read_obj::<u8>(GuestAddress(GUEST_MEM_START))
+                .unwrap(),
+            0x51
+        );
+        let mut lower = vec![0; 1 << 20];
+        file.read_exact_at(&mut lower, 0).unwrap();
+        assert_eq!(&lower[..4096], &[0x51; 4096]);
+        assert!(lower[4096..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn m2_restore_rejects_prealloc_before_mapping() {
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(1 << 20).unwrap();
+        let state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                guest_addr: GUEST_MEM_START,
+                size: 1 << 20,
+                file_offset: 0,
+            }],
+        };
+        let mut builder = AddressSpaceMgrBuilder::new("shmem", "").unwrap();
+        builder.toggle_prealloc(true);
+        let result = builder.build_from_snapshot(
+            &ResourceManager::new(None),
+            &[NumaRegionInfo {
+                size: 1,
+                host_numa_node_id: None,
+                guest_numa_node_id: Some(0),
+                vcpu_ids: vec![0],
+            }],
+            &state,
+            &file,
+        );
+        assert!(
+            result.is_err(),
+            "lazy private restore must reject preallocation"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires dedicated read-only ublk fixture in AENV_M2_MEMORY_DEVICE"]
+    fn m2_block_capacity_uses_blkgetsize64() {
+        use std::os::unix::fs::FileTypeExt;
+        let path = std::env::var("AENV_M2_MEMORY_DEVICE").expect("explicit ublk fixture required");
+        assert!(path.starts_with("/dev/ublkb"));
+        let file = File::open(&path).unwrap();
+        assert!(file.metadata().unwrap().file_type().is_block_device());
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(format!("/sys/class/block/{name}/ro"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        let state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                guest_addr: GUEST_MEM_START,
+                size: 1 << 20,
+                file_offset: 0,
+            }],
+        };
+        let restored = AddressSpaceMgrBuilder::new("shmem", "")
+            .unwrap()
+            .build_from_snapshot(
+                &ResourceManager::new(None),
+                &[NumaRegionInfo {
+                    size: 1,
+                    host_numa_node_id: None,
+                    guest_numa_node_id: Some(0),
+                    vcpu_ids: vec![0],
+                }],
+                &state,
+                &file,
+            )
+            .expect("block capacity is not st_size");
+        let memory = restored.vm_memory().unwrap();
+        let old = memory
+            .read_obj::<u8>(GuestAddress(GUEST_MEM_START))
+            .unwrap();
+        memory
+            .write_obj(old ^ 0xff, GuestAddress(GUEST_MEM_START))
+            .unwrap();
+        use std::os::unix::fs::FileExt;
+        let mut byte = [0];
+        file.read_exact_at(&mut byte, 0).unwrap();
+        assert_eq!(byte[0], old, "private write changed shared block backing");
+    }
+
+    #[test]
+    fn m2_backing_rejects_short_or_wrong_kind() {
+        let infos = [NumaRegionInfo {
+            size: 1,
+            host_numa_node_id: None,
+            guest_numa_node_id: Some(0),
+            vcpu_ids: vec![0],
+        }];
+        let state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                guest_addr: GUEST_MEM_START,
+                size: 1 << 20,
+                file_offset: 0,
+            }],
+        };
+        let short = TempFile::new().unwrap().into_file();
+        short.set_len((1 << 20) - 1).unwrap();
+        assert!(matches!(
+            AddressSpaceMgrBuilder::new("shmem", "")
+                .unwrap()
+                .build_from_snapshot(&ResourceManager::new(None), &infos, &state, &short),
+            Err(AddressManagerError::SnapshotFileTooSmall { .. })
+        ));
+        let wrong = File::open("/dev/zero").unwrap();
+        assert!(
+            matches!(
+                AddressSpaceMgrBuilder::new("shmem", "")
+                    .unwrap()
+                    .build_from_snapshot(&ResourceManager::new(None), &infos, &state, &wrong),
+                Err(AddressManagerError::InvalidOperation)
+            ),
+            "character devices are not RAM backing"
+        );
+    }
+
+    #[test]
+    fn m2_layout_validation_precedes_allocation() {
+        let infos = [
+            NumaRegionInfo {
+                size: 1,
+                host_numa_node_id: None,
+                guest_numa_node_id: Some(0),
+                vcpu_ids: vec![0],
+            },
+            NumaRegionInfo {
+                size: 1,
+                host_numa_node_id: None,
+                guest_numa_node_id: Some(1),
+                vcpu_ids: vec![1],
+            },
+        ];
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(2 << 20).unwrap();
+        let state = GuestMemoryState {
+            regions: vec![
+                GuestMemoryRegionState {
+                    guest_addr: GUEST_MEM_START,
+                    size: 1 << 20,
+                    file_offset: 0,
+                },
+                GuestMemoryRegionState {
+                    guest_addr: GUEST_MEM_START + (1 << 20),
+                    size: 1 << 20,
+                    file_offset: 1 << 20,
+                },
+            ],
+        };
+        for case in 0..7 {
+            let mut bad = state.clone();
+            match case {
+                0 => bad.regions[1].file_offset = 0,
+                1 => bad.regions[1].file_offset = u64::MAX,
+                2 => bad.regions[1].size = u64::MAX,
+                3 => bad.regions[1].guest_addr = u64::MAX,
+                4 => bad.regions.swap(0, 1),
+                5 => {
+                    bad.regions.pop();
+                }
+                _ => bad.regions[1].size -= 1,
+            }
+            let resources = ResourceManager::new(None);
+            assert!(AddressSpaceMgrBuilder::new("shmem", "")
+                .unwrap()
+                .build_from_snapshot(&resources, &infos, &bad, &file)
+                .is_err());
+            assert!(
+                resources
+                    .allocate_mem_address(
+                        &Constraint::new(1u64 << 20)
+                            .min(GUEST_MEM_START)
+                            .max(GUEST_MEM_START + (1 << 20) - 1)
+                    )
+                    .is_some(),
+                "invalid region {} must not allocate the first region",
+                case
+            );
+        }
+        let huge = AddressSpaceMgrBuilder::new("hugetlbfs", "/nonexistent")
+            .unwrap()
+            .build_from_snapshot(&ResourceManager::new(None), &infos, &state, &file);
+        assert!(matches!(huge, Err(AddressManagerError::InvalidOperation)));
+    }
+
+    #[test]
+    fn m2_rejects_machine_size_overflow() {
+        let file = TempFile::new().unwrap().into_file();
+        let state = GuestMemoryState { regions: vec![] };
+        let infos = [NumaRegionInfo {
+            size: u64::MAX,
+            host_numa_node_id: None,
+            guest_numa_node_id: Some(0),
+            vcpu_ids: vec![0],
+        }];
+        assert!(matches!(
+            AddressSpaceMgrBuilder::new("shmem", "")
+                .unwrap()
+                .build_from_snapshot(&ResourceManager::new(None), &infos, &state, &file),
+            Err(AddressManagerError::InvalidOperation)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn m2_private_mapping_packs_eight_gib_across_gpa_hole() {
+        use std::os::unix::fs::FileExt;
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(8u64 << 30).unwrap();
+        file.write_all_at(&[0x34], 3u64 << 30).unwrap();
+        file.write_all_at(&[0x89], (8u64 << 30) - 1).unwrap();
+        let state = GuestMemoryState {
+            regions: vec![
+                GuestMemoryRegionState {
+                    guest_addr: 0,
+                    size: 3u64 << 30,
+                    file_offset: 0,
+                },
+                GuestMemoryRegionState {
+                    guest_addr: 4u64 << 30,
+                    size: 5u64 << 30,
+                    file_offset: 3u64 << 30,
+                },
+            ],
+        };
+        let mgr = AddressSpaceMgrBuilder::new("shmem", "")
+            .unwrap()
+            .build_from_snapshot(
+                &ResourceManager::new(None),
+                &[NumaRegionInfo {
+                    size: 8192,
+                    host_numa_node_id: None,
+                    guest_numa_node_id: Some(0),
+                    vcpu_ids: vec![0],
+                }],
+                &state,
+                &file,
+            )
+            .unwrap();
+        let ram = mgr.vm_memory().unwrap();
+        assert_eq!(ram.num_regions(), 2);
+        assert!(ram.find_region(GuestAddress(3u64 << 30)).is_none());
+        assert_eq!(ram.read_obj::<u8>(GuestAddress(4u64 << 30)).unwrap(), 0x34);
+        assert_eq!(
+            ram.read_obj::<u8>(GuestAddress((9u64 << 30) - 1)).unwrap(),
+            0x89
+        );
+        let high = ram.iter().nth(1).unwrap();
+        assert_eq!(high.file_offset().unwrap().start(), 3u64 << 30);
+        assert_eq!(high.flags() & libc::MAP_SHARED, 0);
+    }
 
     #[test]
     fn test_memory_save_restore_roundtrip() {
