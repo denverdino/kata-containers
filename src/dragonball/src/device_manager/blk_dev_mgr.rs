@@ -346,7 +346,7 @@ pub struct BlockDeviceMgr {
 }
 
 /// Checked backing supplied for an explicitly reserved volume slot.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreBlockBinding {
     /// Stable ID from the captured slot configuration.
     pub slot_id: String,

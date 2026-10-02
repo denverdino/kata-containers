@@ -415,6 +415,18 @@ impl Vm {
         if self.is_vm_initialized() {
             return Err(CaptureError::Rejected("VM is already initialized".into()));
         }
+        let mut slots = std::collections::HashSet::new();
+        for binding in &files.block_bindings {
+            if !slots.insert(&binding.slot_id) {
+                return Err(CaptureError::Rejected(
+                    "duplicate restore slot binding".into(),
+                ));
+            }
+            self.device_manager
+                .block_manager
+                .restore_slot_binding(binding)
+                .map_err(|e| CaptureError::Rejected(e.to_string()))?;
+        }
         self.device_manager
             .validate_capture_profile()
             .map_err(|e| CaptureError::Rejected(e.to_string()))?;
@@ -1993,16 +2005,13 @@ mod tests {
             let real = RealVcpuExecution::new(target.vm_fd.clone());
             target.set_vm_config(config);
             configure_disk_slot(target, placeholder.as_path(), true);
-            target
-                .device_manager
-                .block_manager
-                .restore_slot_binding(&RestoreBlockBinding {
-                    slot_id: "root".into(),
-                    path: backing.as_path().into(),
-                    capacity_bytes: capacity,
-                    backing_read_only: read_only,
-                })
-                .unwrap();
+            let mut snapshot = snapshot;
+            snapshot.block_bindings.push(RestoreBlockBinding {
+                slot_id: "root".into(),
+                path: backing.as_path().into(),
+                capacity_bytes: capacity,
+                backing_read_only: read_only,
+            });
             let loaded = target.load_snapshot_held(
                 &mut events,
                 Default::default(),
