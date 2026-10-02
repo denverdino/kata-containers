@@ -1121,7 +1121,7 @@ impl AddressSpaceMgr {
                         .map_err(|e| {
                             AddressManagerError::AccessGuestMemory(region.guest_addr + offset, e)
                         })?;
-                    if page.iter().all(|byte| *byte == 0) {
+                    if page == [0u8; 4096] {
                         push_page(&mut map.zero_ranges, image_offset);
                     }
                 }
@@ -1915,6 +1915,59 @@ mod tests {
         file.read_exact_at(&mut lower, (3u64 << 30) + 0x2000)
             .unwrap();
         assert_eq!(lower, [0]);
+    }
+
+    #[test]
+    #[ignore = "8 GiB cold-map deadline qualification; requires KVM"]
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    fn m2_cold_eight_gib_map_fits_capture_deadline() {
+        use crate::memory_tracking::MemoryRange;
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm = Arc::new(kvm.create_vm().unwrap());
+        let mut builder = AddressSpaceMgrBuilder::new("shmem", "").unwrap();
+        builder.set_kvm_vm_fd(vm.clone());
+        builder.toggle_dirty_page_logging(true);
+        let mut memory = builder
+            .build(
+                &ResourceManager::new(None),
+                &[NumaRegionInfo {
+                    size: 8192,
+                    host_numa_node_id: None,
+                    guest_numa_node_id: Some(0),
+                    vcpu_ids: vec![0],
+                }],
+            )
+            .unwrap();
+        let ram = memory.vm_memory().unwrap();
+        // Check every byte, including the last byte of low/high-GPA pages.
+        ram.write_obj(1u8, GuestAddress(4095)).unwrap();
+        ram.write_obj(1u8, GuestAddress((9u64 << 30) - 1)).unwrap();
+        let started = std::time::Instant::now();
+        let map = memory.frozen_memory_map(&vm, 1).unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("8 GiB cold memory-map export: {elapsed:?}");
+        assert_eq!(map.regions.len(), 2);
+        assert_eq!(map.regions[1].guest_base, 4u64 << 30);
+        assert_eq!(map.regions[1].image_offset, 3u64 << 30);
+        assert_eq!(
+            map.changed_ranges,
+            vec![MemoryRange {
+                image_offset: 0,
+                length: 8u64 << 30
+            }]
+        );
+        assert_eq!(
+            map.zero_ranges,
+            vec![MemoryRange {
+                image_offset: 4096,
+                length: (8u64 << 30) - 8192
+            }]
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "cold map exceeds the node's 30-second capture RPC deadline: {:?}",
+            elapsed
+        );
     }
 
     #[test]
