@@ -586,6 +586,19 @@ impl Vm {
                 || saved.config.num_queues != config.config.num_queues
                 || saved.config.queue_size != config.config.queue_size
                 || saved.config.is_read_only != config.config.is_read_only
+                || saved.config.is_volume_slot != config.config.is_volume_slot
+                || (saved
+                    .config
+                    .backing_read_only
+                    .unwrap_or(saved.config.is_read_only)
+                    != config
+                        .config
+                        .backing_read_only
+                        .unwrap_or(config.config.is_read_only)
+                    && !self
+                        .device_manager
+                        .block_manager
+                        .has_restore_slot_binding(&saved.config.drive_id))
                 || saved.config.sparse != config.config.sparse
                 || transport.queues.len() != config.config.num_queues
                 || !transport.device_activated
@@ -1322,6 +1335,10 @@ mod tests {
     }
 
     fn configure_disk(vm: &mut Vm, path: &std::path::Path) {
+        configure_disk_slot(vm, path, false);
+    }
+
+    fn configure_disk_slot(vm: &mut Vm, path: &std::path::Path, is_volume_slot: bool) {
         use crate::device_manager::blk_dev_mgr::BlockDeviceConfigInfo;
         let context = DeviceOpContext::create_boot_ctx(vm, None);
         let (sender, _) = std::sync::mpsc::channel();
@@ -1332,6 +1349,7 @@ mod tests {
                 BlockDeviceConfigInfo {
                     drive_id: "root".into(),
                     path_on_host: path.into(),
+                    is_volume_slot,
                     is_direct: false,
                     num_queues: 1,
                     queue_size: 16,
@@ -1346,6 +1364,13 @@ mod tests {
     }
 
     fn paused_counter_vm_with_disk(disk: Option<&std::path::Path>) -> (Vm, RealVcpuExecution) {
+        paused_counter_vm_with_disk_slot(disk, false)
+    }
+
+    fn paused_counter_vm_with_disk_slot(
+        disk: Option<&std::path::Path>,
+        slot: bool,
+    ) -> (Vm, RealVcpuExecution) {
         let mut vm = super::super::tests::create_vm_instance();
         let real = RealVcpuExecution::new(vm.vm_fd.clone());
         let config = VmConfigInfo {
@@ -1358,7 +1383,7 @@ mod tests {
         };
         vm.set_vm_config(config);
         if let Some(path) = disk {
-            configure_disk(&mut vm, path);
+            configure_disk_slot(&mut vm, path, slot);
         }
         vm.init_guest_memory().unwrap();
         let vm_as = vm.vm_as().cloned().unwrap();
@@ -1390,6 +1415,17 @@ mod tests {
                 used_ring: 0x4300,
                 ..Default::default()
             };
+            if slot {
+                let mut guard = mmio.state();
+                let inner = guard.get_inner_device_mut();
+                inner.set_acked_features(0, 6); // SIZE_MAX and SEG_MAX; never guest RO.
+                inner.set_acked_features(1, 1); // VERSION_1.
+                state.queues[0].queue.next_avail = 7;
+                state.queues[0].queue.next_used = 7;
+                let memory = vm.address_space.vm_memory().unwrap();
+                memory.write_obj(7u16, GuestAddress(0x4202)).unwrap();
+                memory.write_obj(7u16, GuestAddress(0x4302)).unwrap();
+            }
             state.driver_status = 0xf;
             state.device_activated = true;
             mmio.restore_state(&state).unwrap();
@@ -1846,5 +1882,205 @@ mod tests {
             resumed, initial,
             "fixture must actually run after explicit release"
         );
+    }
+
+    #[test]
+    fn m2_slot_rejects_template_contract_changes_before_allocation() {
+        let disk = TempFile::new().unwrap();
+        disk.as_file().set_len(4096).unwrap();
+        let (mut source, _real) = paused_counter_vm_with_disk_slot(Some(disk.as_path()), true);
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        let snapshot = files(&state, &memory);
+        source.begin_capture(1, deadline()).unwrap();
+        source
+            .export_held_snapshot(1, deadline(), &snapshot)
+            .unwrap();
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        let config = source.vm_config.clone();
+        let saved =
+            serde_json::to_value(MicrovmState::load_from_file(state.as_path()).unwrap()).unwrap();
+        drop(source);
+        for (slot, guest_ro, backing_ro) in [
+            (false, false, None),
+            (true, true, None),
+            (true, false, Some(true)),
+        ] {
+            let mut modified = saved.clone();
+            let disk_config = &mut modified["device_states"]["block"]["devices"][0]["config"];
+            disk_config["is_volume_slot"] = serde_json::json!(slot);
+            disk_config["is_read_only"] = serde_json::json!(guest_ro);
+            disk_config["backing_read_only"] = serde_json::json!(backing_ro);
+            std::fs::write(state.as_path(), serde_json::to_vec(&modified).unwrap()).unwrap();
+            let mut target = super::super::tests::create_vm_instance();
+            target.set_vm_config(config.clone());
+            configure_disk_slot(&mut target, disk.as_path(), true);
+            assert!(
+                target.read_held_snapshot(&snapshot).is_err(),
+                "reject changed slot contract before allocating guest RAM"
+            );
+            assert!(target.vm_as().is_none());
+        }
+    }
+
+    #[test]
+    fn m2_slot_backing_ro_rejects_raw_write() {
+        use crate::device_manager::{blk_dev_mgr::RestoreBlockBinding, DbsMmioV2Device};
+        for (capacity, read_only) in [(512u64, true), (16384, true), (16384, false)] {
+            let placeholder = TempFile::new().unwrap();
+            placeholder.as_file().set_len(4096).unwrap();
+            let backing = TempFile::new().unwrap();
+            backing.as_file().set_len(capacity).unwrap();
+            backing
+                .as_file()
+                .write_all_at(&[0x3c; 512], capacity - 512)
+                .unwrap();
+            let (mut source, _source_real) =
+                paused_counter_vm_with_disk_slot(Some(placeholder.as_path()), true);
+            let config = source.vm_config.clone();
+            source.begin_capture(1, deadline()).unwrap();
+            let ram = source.address_space.vm_memory().unwrap();
+            // OUT, read last valid sector, then read one sector past the new end.
+            for (request, kind, sector, payload) in [
+                (0u64, 1u32, 0u64, 0x6000u64),
+                (1, 0, capacity / 512 - 1, 0x6200),
+                (2, 0, capacity / 512, 0x6400),
+            ] {
+                let first = request * 3;
+                let header = 0x5000 + request * 32;
+                for (idx, addr, len, flags, next) in [
+                    (first, header, 16u32, 1u16, first + 1),
+                    (
+                        first + 1,
+                        payload,
+                        512,
+                        if kind == 0 { 3 } else { 1 },
+                        first + 2,
+                    ),
+                    (first + 2, 0x7000 + request, 1, 2, 0),
+                ] {
+                    let desc = 0x4000 + idx * 16;
+                    ram.write_obj(addr, GuestAddress(desc)).unwrap();
+                    ram.write_obj(len, GuestAddress(desc + 8)).unwrap();
+                    ram.write_obj(flags, GuestAddress(desc + 12)).unwrap();
+                    ram.write_obj(next as u16, GuestAddress(desc + 14)).unwrap();
+                }
+                ram.write_obj(kind, GuestAddress(header)).unwrap();
+                ram.write_obj(sector, GuestAddress(header + 8)).unwrap();
+                ram.write_obj(first as u16, GuestAddress(0x4204 + (7 + request) * 2))
+                    .unwrap();
+                ram.write_obj(0xffu8, GuestAddress(0x7000 + request))
+                    .unwrap();
+            }
+            ram.write_slice(&[0x5a; 512], GuestAddress(0x6000)).unwrap();
+            ram.write_obj(10u16, GuestAddress(0x4202)).unwrap();
+            let state = TempFile::new().unwrap();
+            let memory = TempFile::new().unwrap();
+            let snapshot = files(&state, &memory);
+            source
+                .export_held_snapshot(1, deadline(), &snapshot)
+                .unwrap();
+            source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+            drop(source);
+
+            let epoll = EpollManager::default();
+            let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+                epoll.clone(),
+            )));
+            let mut events = EventManager::new(&vmm, epoll).unwrap();
+            let mut vmm = vmm.lock().unwrap();
+            let target = vmm.get_vm_mut().unwrap();
+            let real = RealVcpuExecution::new(target.vm_fd.clone());
+            target.set_vm_config(config);
+            configure_disk_slot(target, placeholder.as_path(), true);
+            target
+                .device_manager
+                .block_manager
+                .restore_slot_binding(&RestoreBlockBinding {
+                    slot_id: "root".into(),
+                    path: backing.as_path().into(),
+                    capacity_bytes: capacity,
+                    backing_read_only: read_only,
+                })
+                .unwrap();
+            let loaded = target.load_snapshot_held(
+                &mut events,
+                Default::default(),
+                &snapshot,
+                7,
+                deadline(),
+            );
+            if loaded.is_err() {
+                if let Ok(mut cpus) = target.vcpu_manager() {
+                    cpus.exit_all_vcpus().unwrap();
+                }
+            }
+            loaded.unwrap();
+            let device = target
+                .device_manager
+                .block_manager
+                .iter()
+                .next()
+                .unwrap()
+                .device
+                .as_ref()
+                .unwrap()
+                .clone();
+            let mmio = device.as_any().downcast_ref::<DbsMmioV2Device>().unwrap();
+            let transport = mmio.save_state();
+            let mut capacity_config = [0; 8];
+            let (device_state, _) = crate::device_manager::persist::save_device_state::<
+                dbs_virtio_devices::block::Block<
+                    crate::address_space_manager::GuestAddressSpaceImpl,
+                >,
+            >(&device, ())
+            .unwrap();
+            mmio.state()
+                .get_inner_device_mut()
+                .read_config(0, &mut capacity_config)
+                .unwrap();
+            let ram = target.address_space.vm_memory().unwrap();
+            let held_used = ram.read_obj::<u16>(GuestAddress(0x4302)).unwrap();
+            let held_runs = real.run_count();
+            target.end_capture(7, deadline(), true).unwrap();
+            let end = deadline();
+            while ram.read_obj::<u16>(GuestAddress(0x4302)).unwrap() != 10 && Instant::now() < end {
+                std::thread::yield_now();
+            }
+            target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+            assert_eq!(held_used, 7);
+            assert_eq!(held_runs, 0);
+            assert_eq!(device_state.acked_features, 0x1_0000_0006);
+            assert_eq!(transport.queues[0].queue.next_avail, 7);
+            assert_eq!(transport.queues[0].queue.next_used, 7);
+            assert_eq!(capacity_config, (capacity / 512).to_le_bytes());
+            assert_eq!(transport.config_generation, 1);
+            assert_ne!(
+                transport.interrupt_status & 2,
+                0,
+                "capacity change must notify the guest"
+            );
+            assert_eq!(ram.read_obj::<u16>(GuestAddress(0x4302)).unwrap(), 10);
+            assert_eq!(
+                ram.read_obj::<u8>(GuestAddress(0x7000)).unwrap(),
+                if read_only { 1 } else { 0 }
+            );
+            assert_eq!(ram.read_obj::<u8>(GuestAddress(0x7001)).unwrap(), 0);
+            assert_eq!(ram.read_obj::<u8>(GuestAddress(0x7002)).unwrap(), 1);
+            let mut payload = [0; 512];
+            ram.read_slice(&mut payload, GuestAddress(0x6200)).unwrap();
+            assert_eq!(payload, [0x3c; 512]);
+            backing.as_file().read_exact_at(&mut payload, 0).unwrap();
+            assert_eq!(
+                payload,
+                if !read_only {
+                    [0x5a; 512]
+                } else if capacity == 512 {
+                    [0x3c; 512]
+                } else {
+                    [0; 512]
+                }
+            );
+        }
     }
 }
