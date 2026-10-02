@@ -5,10 +5,11 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
 use dbs_address_space::{AddressSpace, AddressSpaceRegion, AddressSpaceRegionType};
 use dbs_virtio_devices::{Error as VirtioError, VirtioRegionHandler};
 use log::{debug, error};
-use vm_memory::{FileOffset, GuestAddressSpace, GuestMemoryRegion, GuestRegionMmap};
+use vm_memory::{FileOffset, GuestAddressSpace, GuestMemoryRegion};
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
 
@@ -87,7 +88,7 @@ impl DeviceVirtioRegionHandler {
     }
 }
 
-impl VirtioRegionHandler for DeviceVirtioRegionHandler {
+impl VirtioRegionHandler<vm_memory::bitmap::AtomicBitmap> for DeviceVirtioRegionHandler {
     fn insert_region(
         &mut self,
         region: Arc<GuestRegionMmap>,

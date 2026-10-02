@@ -113,7 +113,7 @@ const VIRTIO_MEM_F_ACPI_PXM: u8 = 0;
 
 type MapRegions = Arc<Mutex<Vec<(u32, Option<(u64, u64)>)>>>;
 
-type MultiRegions = Option<(MapRegions, Arc<Mutex<dyn MemRegionFactory>>)>;
+type MultiRegions<R> = Option<(MapRegions, Arc<Mutex<dyn MemRegionFactory<R>>>)>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemError {
@@ -285,13 +285,13 @@ impl<'a> StateChangeRequest<'a> {
 }
 
 /// A hook for the VMM to create memory region for virtio-mem devices.
-pub trait MemRegionFactory: Send {
+pub trait MemRegionFactory<R: GuestMemoryRegion = GuestRegionMmap>: Send {
     fn create_region(
         &mut self,
         guest_addr: GuestAddress,
         region_len: GuestUsize,
         kvm_slot: u32,
-    ) -> std::result::Result<Arc<GuestRegionMmap>, Error>;
+    ) -> std::result::Result<Arc<R>, Error>;
 
     fn restore_region_addr(&self, guest_addr: GuestAddress) -> std::result::Result<*mut u8, Error>;
 
@@ -536,13 +536,13 @@ impl MemTool {
 
     /// The idea of virtio_mem_resize_usable_region is get from QEMU virtio_mem_resize_usable_region
     /// use alignment to calculate usable extent.
-    fn virtio_mem_resize_usable_region(
+    fn virtio_mem_resize_usable_region<R: GuestMemoryRegion>(
         id: &str,
         config: &mut VirtioMemConfig,
         can_shrink: bool,
         alignment: u64,
         // map_regions, factory
-        multi_regions: MultiRegions,
+        multi_regions: MultiRegions<R>,
     ) -> Result<()> {
         let mut newsize = cmp::min(config.region_size, config.requested_size + 2 * alignment);
 
@@ -876,11 +876,11 @@ fn get_map_regions_num(region_size: u64) -> usize {
 }
 
 /// Virtio device for exposing memory hotplug to the guest OS through virtio.
-pub struct Mem<AS: GuestAddressSpace> {
+pub struct Mem<AS: GuestAddressSpace, R: GuestMemoryRegion = GuestRegionMmap> {
     pub(crate) device_info: VirtioDeviceInfo,
     config: Arc<Mutex<VirtioMemConfig>>,
     capacity: u64,
-    factory: Arc<Mutex<dyn MemRegionFactory>>,
+    factory: Arc<Mutex<dyn MemRegionFactory<R>>>,
     host_fd: Option<RawFd>,
     device_change_notifier: Arc<dyn InterruptNotifier>,
     subscriber_id: Option<SubscriberId>,
@@ -894,7 +894,7 @@ pub struct Mem<AS: GuestAddressSpace> {
     map_regions: MapRegions,
 }
 
-impl<AS: GuestAddressSpace> Mem<AS> {
+impl<AS: GuestAddressSpace, R: GuestMemoryRegion> Mem<AS, R> {
     /// Create a new virtio-mem device.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -904,7 +904,7 @@ impl<AS: GuestAddressSpace> Mem<AS> {
         mut multi_region: bool,
         numa_node_id: Option<u16>,
         epoll_mgr: EpollManager,
-        factory: Arc<Mutex<dyn MemRegionFactory>>,
+        factory: Arc<Mutex<dyn MemRegionFactory<R>>>,
         boot_mem_byte: u64,
         f_access_platform: bool,
     ) -> Result<Self> {
@@ -1043,7 +1043,7 @@ impl<AS: GuestAddressSpace> Mem<AS> {
     }
 }
 
-impl<AS, Q, R> VirtioDevice<AS, Q, R> for Mem<AS>
+impl<AS, Q, R> VirtioDevice<AS, Q, R> for Mem<AS, R>
 where
     AS: DbsGuestAddressSpace,
     Q: QueueT + Send + 'static,
@@ -1630,7 +1630,7 @@ pub(crate) mod tests {
         let id = "mem0".to_string();
 
         // unshrink.
-        MemTool::virtio_mem_resize_usable_region(
+        MemTool::virtio_mem_resize_usable_region::<GuestRegionMmap>(
             &id,
             &mut config,
             false,
@@ -1644,7 +1644,7 @@ pub(crate) mod tests {
         );
 
         // request size is 0.
-        MemTool::virtio_mem_resize_usable_region(
+        MemTool::virtio_mem_resize_usable_region::<GuestRegionMmap>(
             &id,
             &mut config,
             true,
@@ -1659,7 +1659,7 @@ pub(crate) mod tests {
 
         // shrink.
         config.requested_size = 0x5;
-        MemTool::virtio_mem_resize_usable_region(
+        MemTool::virtio_mem_resize_usable_region::<GuestRegionMmap>(
             &id,
             &mut config,
             true,
@@ -1676,7 +1676,7 @@ pub(crate) mod tests {
         config.region_size = 2 << 30;
         config.requested_size = 1 << 30;
         // alignment unchanged.
-        MemTool::virtio_mem_resize_usable_region(
+        MemTool::virtio_mem_resize_usable_region::<GuestRegionMmap>(
             &id,
             &mut config,
             true,
@@ -1689,7 +1689,7 @@ pub(crate) mod tests {
             (1 << 30) + 2 * VIRTIO_MEM_DEFAULT_BLOCK_ALIGNMENT
         );
         // alignemnt changed.
-        MemTool::virtio_mem_resize_usable_region(
+        MemTool::virtio_mem_resize_usable_region::<GuestRegionMmap>(
             &id,
             &mut config,
             true,

@@ -316,12 +316,13 @@ impl<AS: GuestAddressSpace> VhostUserFs<AS> {
     }
 }
 
-impl<AS, Q> VirtioDevice<AS, Q, GuestRegionMmap> for VhostUserFs<AS>
+impl<AS, Q, B> VirtioDevice<AS, Q, GuestRegionMmap<B>> for VhostUserFs<AS>
 where
     AS: 'static + GuestAddressSpace + Clone + Send + Sync,
     AS::T: Send,
     AS::M: Sync + Send,
     Q: QueueT + Send + 'static,
+    B: vm_memory::bitmap::NewBitmap + Send + Sync + 'static,
 {
     fn device_type(&self) -> u32 {
         TYPE_VIRTIO_FS
@@ -353,7 +354,10 @@ where
         self.device().device_info.write_config(offset, data)
     }
 
-    fn activate(&mut self, config: VirtioDeviceConfig<AS, Q>) -> ActivateResult {
+    fn activate(
+        &mut self,
+        config: VirtioDeviceConfig<AS, Q, GuestRegionMmap<B>>,
+    ) -> ActivateResult {
         trace!(target: "vhost-fs", "{}: VirtioDevice::activate()", self.id());
 
         let mut device = self.device.lock().unwrap();
@@ -432,7 +436,7 @@ where
         &mut self,
         vm_fd: Arc<VmFd>,
         resource: DeviceResources,
-    ) -> VirtioResult<Option<VirtioSharedMemoryList<GuestRegionMmap>>> {
+    ) -> VirtioResult<Option<VirtioSharedMemoryList<GuestRegionMmap<B>>>> {
         trace!(target: "vhost-fs", "{}: VirtioDevice::set_resource()", self.id());
 
         let mmio_res = resource.get_mmio_address_ranges();
@@ -658,7 +662,7 @@ mod tests {
             let resources = DeviceResources::new();
             let queues = vec![VirtioQueueConfig::<QueueSync>::create(128, 0).unwrap()];
             let address_space = create_address_space();
-            let config = VirtioDeviceConfig::new(
+            let config = VirtioDeviceConfig::<_, _, GuestRegionMmap>::new(
                 Arc::new(mem),
                 address_space,
                 vm_fd,
@@ -702,7 +706,7 @@ mod tests {
             .unwrap();
             let resources = DeviceResources::new();
             let address_space = create_address_space();
-            let config = VirtioDeviceConfig::new(
+            let config = VirtioDeviceConfig::<_, _, GuestRegionMmap>::new(
                 Arc::new(mem),
                 address_space,
                 vm_fd,

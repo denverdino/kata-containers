@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, Weak};
 
+use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
 use dbs_device::resources::Resource::LegacyIrq;
 use dbs_device::resources::{DeviceResources, Resource, ResourceConstraint};
 use dbs_device::DeviceIo;
@@ -28,10 +29,7 @@ use kvm_ioctls::{DeviceFd, VmFd};
 use log::{debug, error};
 use serde_derive::{Deserialize, Serialize};
 use vfio_ioctls::{VfioContainer, VfioDevice};
-use vm_memory::{
-    Address, GuestAddressSpace, GuestMemory, GuestMemoryRegion, GuestRegionMmap,
-    MemoryRegionAddress,
-};
+use vm_memory::{Address, GuestAddressSpace, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 
 use super::StartMicroVmError;
 use crate::address_space_manager::{GuestAddressSpaceImpl, GuestMemoryImpl};

@@ -869,6 +869,63 @@ mod tests {
     }
 
     #[test]
+    fn m2_userspace_writes_merge_into_cumulative_map() {
+        with_loaded_counter(|vm, input| {
+            let ram = vm.address_space.vm_memory().unwrap();
+            ram.write_slice(&[0x4c; 4096], GuestAddress(0x6000))
+                .unwrap();
+            let map = vm.export_held_memory_map(1, deadline()).unwrap();
+            assert!(
+                map.changed_ranges
+                    .iter()
+                    .any(|range| range.image_offset <= 0x6000
+                        && range.image_offset + range.length > 0x6000),
+                "userspace writes are not covered by KVM dirty logging"
+            );
+            assert!(
+                map.changed_ranges
+                    .iter()
+                    .map(|range| range.length)
+                    .sum::<u64>()
+                    < 16 << 20
+            );
+            let mut rebuilt = vec![0u8; 16 << 20];
+            input.memory.read_exact_at(&mut rebuilt, 0).unwrap();
+            for changed in &map.changed_ranges {
+                for region in &map.regions {
+                    let start = changed.image_offset.max(region.image_offset);
+                    let end = (changed.image_offset + changed.length)
+                        .min(region.image_offset + region.length);
+                    if start < end {
+                        ram.read_slice(
+                            &mut rebuilt[start as usize..end as usize],
+                            GuestAddress(region.guest_base + start - region.image_offset),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            let full_state = TempFile::new().unwrap();
+            let full_ram = TempFile::new().unwrap();
+            vm.export_held_snapshot(1, deadline(), &files(&full_state, &full_ram))
+                .unwrap();
+            let mut oracle = vec![0u8; rebuilt.len()];
+            full_ram.as_file().read_exact_at(&mut oracle, 0).unwrap();
+            assert_eq!(
+                rebuilt, oracle,
+                "incremental reconstruction must match full export at the same hold"
+            );
+            vm.release_held_memory_map(1).unwrap();
+            vm.end_capture(1, deadline(), false).unwrap();
+            vm.begin_capture(2, deadline()).unwrap();
+            let again = vm.export_held_memory_map(2, deadline()).unwrap();
+            assert_eq!(again.changed_ranges, map.changed_ranges);
+            vm.release_held_memory_map(2).unwrap();
+            vm.end_capture(2, deadline(), false).unwrap();
+        });
+    }
+
+    #[test]
     fn m2_state_only_rejects_cold_live_backing_alias() {
         let (mut vm, _real) = paused_counter_vm();
         vm.begin_capture(1, deadline()).unwrap();

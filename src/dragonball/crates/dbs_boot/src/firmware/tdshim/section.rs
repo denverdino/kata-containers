@@ -8,7 +8,7 @@ use super::TdvfError;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
 /// TDVF descriptor
 #[repr(C, packed)]
@@ -127,10 +127,10 @@ pub fn parse_tdvf_sections(file: &mut File) -> Result<Vec<TdvfSection>, TdvfErro
 /// * `file` - The tdshim image file.
 /// * `section` - The metadata of target section.
 /// * `mem` - Guest memory to load TDVF section to.
-pub fn load_tdvf_section(
+pub fn load_tdvf_section<M: GuestMemory + ?Sized>(
     file: &mut File,
     section: &TdvfSection,
-    mem: &GuestMemoryMmap,
+    mem: &M,
 ) -> Result<(), TdvfError> {
     file.seek(SeekFrom::Start(section.data_offset as u64))
         .map_err(TdvfError::TdshimFileError)?;

@@ -42,13 +42,19 @@ use log::{debug, error, info, warn};
 use nix::sys::mman;
 use nix::unistd::dup;
 use serde_derive::{Deserialize, Serialize};
+use vm_memory::bitmap::AtomicBitmap;
+#[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+use vm_memory::bitmap::Bitmap;
 #[cfg(feature = "atomic-guest-memory")]
 use vm_memory::GuestMemoryAtomic;
 use vm_memory::{
     address::Address, Bytes, FileOffset, GuestAddress, GuestAddressSpace, GuestMemory,
-    GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap, GuestUsize, MemoryRegionAddress,
-    MmapRegion,
+    GuestMemoryRegion, GuestUsize, MemoryRegionAddress,
 };
+
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
+type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
+type MmapRegion = vm_memory::MmapRegion<AtomicBitmap>;
 
 use crate::resource_manager::ResourceManager;
 use crate::vm::NumaRegionInfo;
@@ -62,7 +68,7 @@ pub type GuestAddressSpaceImpl = Arc<GuestMemoryMmap>;
 pub type GuestAddressSpaceImpl = GuestMemoryAtomic<GuestMemoryMmap>;
 
 /// Concrete GuestMemory type used by the VMM.
-pub type GuestMemoryImpl = <Arc<vm_memory::GuestMemoryMmap> as GuestAddressSpace>::M;
+pub type GuestMemoryImpl = <Arc<GuestMemoryMmap> as GuestAddressSpace>::M;
 /// Concrete GuestRegion type used by the VMM.
 pub type GuestRegionImpl = GuestRegionMmap;
 
@@ -544,7 +550,7 @@ impl AddressSpaceMgr {
 
         #[cfg(feature = "atomic-guest-memory")]
         {
-            self.vm_as = Some(AddressSpace::convert_into_vm_as(vm_memory));
+            self.vm_as = Some(GuestMemoryAtomic::new(vm_memory));
         }
         #[cfg(not(feature = "atomic-guest-memory"))]
         {
@@ -991,8 +997,15 @@ impl AddressSpaceMgr {
                 image_offset: region.file_offset,
                 length: region.size,
             });
+            let software = memory
+                .find_region(GuestAddress(region.guest_addr))
+                .ok_or(AddressManagerError::InvalidOperation)?
+                .bitmap();
             for offset in (0..region.size).step_by(4096) {
                 let image_offset = region.file_offset + offset;
+                if software.dirty_at(offset as usize) {
+                    self.memory_tracker.mark_page(image_offset);
+                }
                 if self.memory_tracker.dirty(image_offset) {
                     push_page(&mut map.changed_ranges, image_offset);
                     memory

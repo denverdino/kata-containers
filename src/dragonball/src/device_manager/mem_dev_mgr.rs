@@ -4,6 +4,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
 use dbs_address_space::{
     AddressSpace, AddressSpaceError, AddressSpaceRegion, MPOL_MF_MOVE, MPOL_PREFERRED, USABLE_END,
 };
@@ -16,9 +17,8 @@ use serde_derive::{Deserialize, Serialize};
 use slog::{debug, error, info, warn};
 use virtio::mem::{Mem, MemRegionFactory};
 use virtio::Error as VirtioError;
-use vm_memory::{
-    Address, GuestAddress, GuestAddressSpace, GuestMemory, GuestRegionMmap, GuestUsize, MmapRegion,
-};
+use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsize};
+type MmapRegion = vm_memory::MmapRegion<vm_memory::bitmap::AtomicBitmap>;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
 #[cfg(target_arch = "x86_64")]
@@ -274,7 +274,8 @@ impl MemDeviceMgr {
         config: &MemDeviceConfigInfo,
         ctx: &DeviceOpContext,
         epoll_mgr: &EpollManager,
-    ) -> std::result::Result<virtio::mem::Mem<GuestAddressSpaceImpl>, DeviceMgrError> {
+    ) -> std::result::Result<virtio::mem::Mem<GuestAddressSpaceImpl, GuestRegionMmap>, DeviceMgrError>
+    {
         let factory = Arc::new(Mutex::new(MemoryRegionFactory::new(
             ctx,
             config.mem_id.clone(),
@@ -339,7 +340,7 @@ impl MemDeviceMgr {
             let inner_dev = guard.get_inner_device();
             if let Some(mem_dev) = inner_dev
                 .as_any()
-                .downcast_ref::<Mem<GuestAddressSpaceImpl>>()
+                .downcast_ref::<Mem<GuestAddressSpaceImpl, GuestRegionMmap>>()
             {
                 return mem_dev
                     .set_requested_size(size_mib)
@@ -485,7 +486,7 @@ impl MemoryRegionFactory {
     }
 }
 
-impl MemRegionFactory for MemoryRegionFactory {
+impl MemRegionFactory<GuestRegionMmap> for MemoryRegionFactory {
     fn create_region(
         &mut self,
         guest_addr: GuestAddress,

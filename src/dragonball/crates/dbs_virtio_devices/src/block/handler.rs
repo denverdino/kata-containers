@@ -344,6 +344,17 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT> InnerBlockEpollHandler<AS, Q> {
                     // memory maliciously.
                     let _ = mem.write_obj(*res2 as u8, req.status_addr);
                     let data_descs = &self.data_desc_vec[req.request_index as usize];
+                    if req.request_type == RequestType::In {
+                        // AIO writes through raw iovecs, bypassing VolatileSlice.
+                        // Mark even an error completion: it may have written a prefix.
+                        for io in data_descs {
+                            crate::memory_tracking::mark_guest_write(
+                                mem,
+                                GuestAddress(io.data_addr),
+                                io.data_len,
+                            )?;
+                        }
+                    }
                     let len = match req.request_type {
                         RequestType::In => req.data_len(data_descs),
                         RequestType::Out => 0,
