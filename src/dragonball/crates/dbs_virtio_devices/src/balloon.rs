@@ -24,7 +24,8 @@ use std::mem::size_of;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, TryLockError};
+use std::time::Instant;
 
 use dbs_device::resources::ResourceConstraint;
 use dbs_interrupt::{InterruptNotifier, NoopNotifier};
@@ -33,7 +34,7 @@ use dbs_utils::epoll_manager::{
 };
 use dbs_utils::metric::{IncMetric, SharedIncMetric, SharedStoreMetric, StoreMetric};
 use log::{debug, error, info, trace};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1};
 use virtio_queue::{QueueOwnedT, QueueSync, QueueT};
 use vm_memory::{
@@ -41,6 +42,7 @@ use vm_memory::{
     GuestRegionMmap, MemoryRegionAddress,
 };
 
+use crate::capture::{CaptureError, CaptureGate, CaptureGeneration, CaptureResult, WorkerAck};
 use crate::device::{VirtioDevice, VirtioDeviceConfig, VirtioDeviceInfo, VirtioQueueConfig};
 use crate::{
     ActivateResult, ConfigError, ConfigResult, DbsGuestAddressSpace, Error, Result, TYPE_BALLOON,
@@ -111,6 +113,89 @@ pub struct BalloonDeviceMetrics {
 
 pub type BalloonResult<T> = std::result::Result<T, BalloonError>;
 
+/// Memory-owner operation for guest-returned full pages. Never modifies a lower image.
+pub trait BalloonReclaimer: Send + Sync {
+    fn reclaim_private_range(&self, guest_addr: u64, length: u64) -> io::Result<()>;
+}
+
+// Capture and epoll callbacks own the same concrete handler lock. No callback can
+// still be writing guest memory when a successful hold acknowledgement is returned.
+struct BalloonSubscriber<T>(Arc<Mutex<T>>);
+
+impl<T: MutEventSubscriber> MutEventSubscriber for BalloonSubscriber<T> {
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
+        self.0
+            .lock()
+            .expect("balloon handler lock poisoned")
+            .process(events, ops);
+    }
+
+    fn init(&mut self, ops: &mut EventOps) {
+        self.0
+            .lock()
+            .expect("balloon handler lock poisoned")
+            .init(ops);
+    }
+}
+
+trait BalloonCaptureController: Send {
+    fn request_hold(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck>;
+    fn resume_capture(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()>;
+}
+
+/// Cloneable control for an activated balloon handler, independent of its transport lock.
+#[derive(Clone)]
+pub struct BalloonCaptureControl(Arc<Mutex<dyn BalloonCaptureController>>);
+
+impl BalloonCaptureControl {
+    fn with_handler<T>(
+        &self,
+        deadline: Instant,
+        action: impl FnOnce(&mut dyn BalloonCaptureController) -> CaptureResult<T>,
+    ) -> CaptureResult<T> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(CaptureError::Timeout);
+            }
+            match self.0.try_lock() {
+                Ok(mut handler) => return action(&mut *handler),
+                Err(TryLockError::Poisoned(_)) => return Err(CaptureError::Disconnected),
+                Err(TryLockError::WouldBlock) => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Wait for any in-progress callback and freeze subsequent inflate/deflate/reporting writes.
+    pub fn request_hold(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        self.with_handler(deadline, |handler| {
+            handler.request_hold(generation, deadline)
+        })
+    }
+
+    /// Release the exact generation and kick the saved queues.
+    pub fn resume_capture(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()> {
+        self.with_handler(deadline, |handler| {
+            handler.resume_capture(generation, deadline)
+        })
+    }
+}
+
 // Got from include/uapi/linux/virtio_balloon.h
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -135,12 +220,61 @@ pub struct BalloonEpollHandler<
     pub(crate) reporting: Option<VirtioQueueConfig<Q>>,
     balloon_config: Arc<Mutex<VirtioBalloonConfig>>,
     metrics: Arc<BalloonDeviceMetrics>,
+    capture: CaptureGate,
+    reclaimer: Option<Arc<dyn BalloonReclaimer>>,
+}
+
+impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion + Send + Sync>
+    BalloonCaptureController for BalloonEpollHandler<AS, Q, R>
+{
+    fn request_hold(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        let (reply, receiver) = mpsc::channel();
+        self.capture.begin(generation, deadline, reply);
+        if self.capture.needs_ack() {
+            self.capture.finish_report(Ok(self.capture.held_ack(false)));
+        }
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| CaptureError::Timeout)?
+    }
+
+    fn resume_capture(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()> {
+        if deadline <= Instant::now() {
+            return Err(CaptureError::Timeout);
+        }
+        if self.capture.release(generation)? {
+            for queue in [
+                Some(&self.inflate),
+                Some(&self.deflate),
+                self.reporting.as_ref(),
+            ]
+            .iter()
+            .flatten()
+            {
+                queue
+                    .generate_event()
+                    .map_err(|error| CaptureError::ControlIo(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion>
     BalloonEpollHandler<AS, Q, R>
 {
     fn process_reporting_queue(&mut self) -> bool {
+        if self.capture.is_held() {
+            return true;
+        }
         self.metrics.reporting_count.inc();
         if let Some(queue) = &mut self.reporting {
             if let Err(e) = queue.consume_event() {
@@ -175,7 +309,11 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion>
                     let addr = avail_desc.addr();
                     len += size;
 
-                    if let Some(region) = mem.find_region(addr) {
+                    if let Some(owner) = &self.reclaimer {
+                        if let Err(error) = owner.reclaim_private_range(addr.0, u64::from(size)) {
+                            error!("balloon reporting reclaim failed: {error}");
+                        }
+                    } else if let Some(region) = mem.find_region(addr) {
                         let host_addr = match mem.get_host_address(addr) {
                             Ok(v) => v,
                             Err(e) => {
@@ -250,6 +388,9 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion>
     }
 
     fn process_queue(&mut self, idx: u32) -> bool {
+        if self.capture.is_held() {
+            return true;
+        }
         let conf = &mut self.config;
         match idx {
             INFLATE_QUEUE_AVAIL_EVENT => self.metrics.inflate_count.inc(),
@@ -345,7 +486,16 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT + Send, R: GuestMemoryRegion>
 
                 let guest_addr = (pfn as u64) << VIRTIO_BALLOON_PFN_SHIFT;
 
-                if let Some(region) = mem.find_region(GuestAddress(guest_addr)) {
+                if let Some(owner) = &self.reclaimer {
+                    if idx == INFLATE_QUEUE_AVAIL_EVENT {
+                        if let Err(error) = owner.reclaim_private_range(guest_addr, pfn_len as u64)
+                        {
+                            error!("balloon inflate reclaim failed: {error}");
+                        }
+                    }
+                    // Deflate only returns ownership to the guest; it must never
+                    // refault the original nonzero ancestor or undo private zeros.
+                } else if let Some(region) = mem.find_region(GuestAddress(guest_addr)) {
                     let host_addr = mem.get_host_address(GuestAddress(guest_addr)).unwrap();
                     if advice == libc::MADV_DONTNEED && region.file_offset().is_some() {
                         advice = libc::MADV_REMOVE;
@@ -456,6 +606,19 @@ where
     }
 
     fn process(&mut self, events: Events, _ops: &mut EventOps) {
+        if self.capture.is_held() {
+            // Drain eventfds, never descriptors. Resume kicks all saved queues.
+            let queue = match events.data() {
+                INFLATE_QUEUE_AVAIL_EVENT => Some(&self.inflate),
+                DEFLATE_QUEUE_AVAIL_EVENT => Some(&self.deflate),
+                REPORTING_QUEUE_AVAIL_EVENT => self.reporting.as_ref(),
+                _ => None,
+            };
+            if let Some(queue) = queue {
+                let _ = queue.consume_event();
+            }
+            return;
+        }
         let guard = self.config.lock_guest_memory();
         let _mem = guard.deref();
         let idx = events.data();
@@ -505,6 +668,10 @@ pub struct Balloon<AS: GuestAddressSpace> {
     pub(crate) subscriber_id: Option<SubscriberId>,
     pub(crate) phantom: PhantomData<AS>,
     metrics: Arc<BalloonDeviceMetrics>,
+    capture_controller: Option<BalloonCaptureControl>,
+    capture_id: String,
+    capture_on_activate: Option<CaptureGeneration>,
+    reclaimer: Option<Arc<dyn BalloonReclaimer>>,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -552,7 +719,48 @@ impl<AS: GuestAddressSpace> Balloon<AS> {
             subscriber_id: None,
             phantom: PhantomData,
             metrics: Arc::new(BalloonDeviceMetrics::default()),
+            capture_controller: None,
+            capture_id: BALLOON_DRIVER_NAME.into(),
+            capture_on_activate: None,
+            reclaimer: None,
         })
+    }
+
+    /// Bind capture identity and the RAM owner before activation.
+    pub fn set_capture_memory(
+        &mut self,
+        id: String,
+        reclaimer: Arc<dyn BalloonReclaimer>,
+    ) -> Result<()> {
+        if id.is_empty() || self.subscriber_id.is_some() {
+            return Err(Error::InvalidInput);
+        }
+        self.capture_id = id;
+        self.reclaimer = Some(reclaimer);
+        Ok(())
+    }
+
+    /// Arm a restored device before activation can register a writer.
+    pub fn arm_capture(&mut self, generation: CaptureGeneration) -> CaptureResult<()> {
+        if generation.0 == 0
+            || self.capture_controller.is_some()
+            || self.capture_on_activate.is_some()
+            || self.reclaimer.is_none()
+        {
+            return Err(CaptureError::StaleGeneration);
+        }
+        self.capture_on_activate = Some(generation);
+        Ok(())
+    }
+
+    /// Access the callback lock without retaining the MMIO transport lock.
+    pub fn capture_control(&self) -> CaptureResult<BalloonCaptureControl> {
+        if self.reclaimer.is_none() {
+            return Err(CaptureError::Disconnected);
+        }
+        self.capture_controller
+            .clone()
+            .ok_or(CaptureError::Disconnected)
     }
 
     pub fn set_size(&self, size_mb: u64) -> Result<()> {
@@ -571,6 +779,49 @@ impl<AS: GuestAddressSpace> Balloon<AS> {
 
     pub fn metrics(&self) -> Arc<BalloonDeviceMetrics> {
         self.metrics.clone()
+    }
+}
+
+/// Balloon-specific snapshot state. Queue progress and activation are persisted
+/// by the enclosing MMIO transport, using the handler's shared queue objects.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BalloonState {
+    pub device_info: crate::persist::VirtioDeviceInfoState,
+    pub num_pages: u32,
+    pub actual: u32,
+}
+
+impl<'a, AS: GuestAddressSpace> crate::persist::VirtioDevicePersist<'a> for Balloon<AS> {
+    type State = BalloonState;
+    type SaveArgs = ();
+    type RestoreArgs = ();
+    type Error = Error;
+
+    fn save_state(&mut self, _: ()) -> Result<Self::State> {
+        let config = self.config.lock().map_err(|_| Error::InvalidInput)?;
+        let mut device_info = self.device_info.save_state();
+        device_info.config_space = config.as_slice().to_vec();
+        Ok(BalloonState {
+            device_info,
+            num_pages: config.num_pages,
+            actual: config.actual,
+        })
+    }
+
+    fn restore_state(&mut self, state: &Self::State, _: ()) -> Result<()> {
+        let config = VirtioBalloonConfig {
+            num_pages: state.num_pages,
+            actual: state.actual,
+        };
+        if self.subscriber_id.is_some()
+            || state.device_info.acked_features & !state.device_info.avail_features != 0
+            || state.device_info.config_space != config.as_slice()
+        {
+            return Err(Error::InvalidInput);
+        }
+        self.device_info.restore_state(&state.device_info)?;
+        *self.config.lock().map_err(|_| Error::InvalidInput)? = config;
+        Ok(())
     }
 }
 
@@ -661,16 +912,26 @@ where
             reporting = Some(config.queues.remove(0));
         }
 
-        let handler = Box::new(BalloonEpollHandler {
+        let mut capture = CaptureGate::armed(self.capture_id.clone(), self.capture_on_activate);
+        if capture.is_held() {
+            capture.finish_report(Ok(capture.held_ack(false)));
+        }
+        let handler = Arc::new(Mutex::new(BalloonEpollHandler {
             config,
             inflate,
             deflate,
             reporting,
             balloon_config: self.config.clone(),
             metrics: self.metrics.clone(),
-        });
+            capture,
+            reclaimer: self.reclaimer.clone(),
+        }));
 
-        self.subscriber_id = Some(self.device_info.register_event_handler(handler));
+        self.capture_controller = Some(BalloonCaptureControl(handler.clone()));
+        self.subscriber_id = Some(
+            self.device_info
+                .register_event_handler(Box::new(BalloonSubscriber(handler))),
+        );
 
         Ok(())
     }
@@ -739,7 +1000,152 @@ pub(crate) mod tests {
             reporting,
             balloon_config,
             metrics,
+            capture: CaptureGate::new(BALLOON_DRIVER_NAME.to_string()),
+            reclaimer: None,
         }
+    }
+
+    #[test]
+    fn m2_balloon_held_blocks_reporting() {
+        let mut handler = create_balloon_epoll_handler();
+        let memory = handler.config.vm_as.clone();
+        let vq = VirtQueue::new(GuestAddress(0), &memory, 16);
+        let queue = vq.create_queue();
+        vq.avail.idx().store(1);
+        vq.avail.ring(0).store(0);
+        vq.dtable(0).set(0x2000, 0x1000, 2, 0);
+        memory
+            .write_slice(&[0x71; 4096], GuestAddress(0x2000))
+            .unwrap();
+        handler.reporting = Some(VirtioQueueConfig::new(
+            queue,
+            Arc::new(EventFd::new(0).unwrap()),
+            Arc::new(NoopNotifier::new()),
+            2,
+        ));
+        handler
+            .reporting
+            .as_ref()
+            .unwrap()
+            .generate_event()
+            .unwrap();
+        handler.capture = CaptureGate::armed("balloon:test".into(), Some(CaptureGeneration(1)));
+        assert!(handler.process_reporting_queue());
+        assert_eq!(
+            handler.reporting.as_ref().unwrap().queue().next_used(),
+            0,
+            "held reporting must not consume descriptors or update the used ring"
+        );
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0x2000)).unwrap(), 0x71);
+    }
+
+    #[test]
+    fn m2_balloon_restore_preserves_progress() {
+        use crate::persist::VirtioDevicePersist;
+        let create = || {
+            Balloon::<Arc<GuestMemoryMmap>>::new(
+                EpollManager::default(),
+                BalloonConfig {
+                    f_deflate_on_oom: true,
+                    f_reporting: true,
+                },
+                false,
+            )
+            .unwrap()
+        };
+        let mut source = create();
+        source.set_size(17).unwrap();
+        source.config.lock().unwrap().actual = 321;
+        source.device_info.acked_features = source.device_info.avail_features;
+        let state = source.save_state(()).unwrap();
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let mut restored = create();
+        restored
+            .restore_state(&serde_json::from_slice(&encoded).unwrap(), ())
+            .unwrap();
+        assert_eq!(
+            *restored.config.lock().unwrap(),
+            *source.config.lock().unwrap()
+        );
+        assert_eq!(
+            restored.device_info.acked_features,
+            source.device_info.acked_features
+        );
+    }
+
+    #[test]
+    fn m2_balloon_callback_lock_and_resume() {
+        use std::time::Duration;
+        let mut handler = create_balloon_epoll_handler();
+        let memory = handler.config.vm_as.clone();
+        let vq = VirtQueue::new(GuestAddress(0), &memory, 16);
+        vq.avail.idx().store(1);
+        vq.avail.ring(0).store(0);
+        vq.dtable(0).set(0x2000, 0x1000, 2, 0);
+        memory
+            .write_slice(&[0x71; 4096], GuestAddress(0x2000))
+            .unwrap();
+        handler.reporting = Some(VirtioQueueConfig::new(
+            vq.create_queue(),
+            Arc::new(EventFd::new(0).unwrap()),
+            Arc::new(NoopNotifier::new()),
+            2,
+        ));
+        let event = handler.reporting.as_ref().unwrap().eventfd.clone();
+        let handler = Arc::new(Mutex::new(handler));
+        let control = BalloonCaptureControl(handler.clone());
+        let mut epoll = EpollManager::default();
+        let subscriber = epoll.add_subscriber(Box::new(BalloonSubscriber(handler.clone())));
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        {
+            let guard = handler.lock().unwrap();
+            assert!(matches!(
+                control.request_hold(
+                    CaptureGeneration(1),
+                    Instant::now() + Duration::from_millis(5)
+                ),
+                Err(CaptureError::Timeout)
+            ));
+            assert!(!guard.capture.is_held());
+        }
+        let ack = control
+            .request_hold(CaptureGeneration(1), deadline())
+            .unwrap();
+        assert_eq!(ack.memory_writers, 0);
+        event.write(1).unwrap();
+        epoll.handle_events(0).unwrap();
+        assert_eq!(
+            handler
+                .lock()
+                .unwrap()
+                .reporting
+                .as_ref()
+                .unwrap()
+                .queue()
+                .next_used(),
+            0
+        );
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0x2000)).unwrap(), 0x71);
+        assert!(control
+            .resume_capture(CaptureGeneration(2), deadline())
+            .is_err());
+        control
+            .resume_capture(CaptureGeneration(1), deadline())
+            .unwrap();
+        epoll.handle_events(0).unwrap();
+        assert_eq!(
+            handler
+                .lock()
+                .unwrap()
+                .reporting
+                .as_ref()
+                .unwrap()
+                .queue()
+                .next_used(),
+            1
+        );
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0x2000)).unwrap(), 0);
+        epoll.remove_subscriber(subscriber).unwrap();
     }
 
     #[test]

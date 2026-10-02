@@ -61,6 +61,8 @@ fn validate_acks(
 enum CaptureControl {
     Block(WorkerCaptureControl),
     Net(NetCaptureControl),
+    #[cfg(feature = "virtio-balloon")]
+    Balloon(dbs_virtio_devices::balloon::BalloonCaptureControl),
 }
 
 struct CaptureTarget {
@@ -80,6 +82,8 @@ impl CaptureTarget {
         match &self.control {
             CaptureControl::Block(control) => control.request_hold(generation, deadline),
             CaptureControl::Net(control) => control.request_hold(generation, deadline),
+            #[cfg(feature = "virtio-balloon")]
+            CaptureControl::Balloon(control) => control.request_hold(generation, deadline),
         }
     }
 
@@ -87,6 +91,8 @@ impl CaptureTarget {
         match &self.control {
             CaptureControl::Block(control) => control.resume(generation, deadline),
             CaptureControl::Net(control) => control.resume_capture(generation, deadline),
+            #[cfg(feature = "virtio-balloon")]
+            CaptureControl::Balloon(control) => control.resume_capture(generation, deadline),
         }
     }
 }
@@ -166,6 +172,15 @@ impl DeviceManager {
 
     /// Arm all fresh MMIO devices before any activation is replayed.
     pub(crate) fn arm_capture_restore(&mut self, generation: CaptureGeneration) -> Result<()> {
+        #[cfg(feature = "virtio-balloon")]
+        for info in self.balloon_manager.info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached balloon".into()))?;
+            super::persist::arm_device_capture(device, generation)
+                .map_err(|e| DeviceCaptureError::Rejected(e.to_string()))?;
+        }
         for info in self.block_manager.iter() {
             let device = info
                 .device
@@ -211,9 +226,15 @@ impl DeviceManager {
             ));
         }
         #[cfg(feature = "virtio-balloon")]
-        if !self.balloon_manager.info_list.is_empty() {
+        if self.balloon_manager.info_list.len() > 1
+            || self
+                .balloon_manager
+                .info_list
+                .iter()
+                .any(|info| info.config.balloon_id.is_empty())
+        {
             return Err(DeviceCaptureError::Rejected(
-                "virtio-balloon memory writer is unsupported".to_string(),
+                "unsupported balloon inventory".into(),
             ));
         }
         #[cfg(feature = "virtio-rng")]
@@ -263,6 +284,24 @@ impl DeviceManager {
     fn capture_targets(&self, deadline: Instant) -> Result<Vec<CaptureTarget>> {
         self.validate_capture_profile()?;
         let mut targets = Vec::new();
+        #[cfg(feature = "virtio-balloon")]
+        for info in self.balloon_manager.info_list.iter() {
+            use dbs_virtio_devices::balloon::Balloon;
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached balloon".into()))?;
+            let control = device_control::<Balloon<GuestAddressSpaceImpl>, _>(
+                device,
+                deadline,
+                Balloon::capture_control,
+            )?;
+            targets.push(CaptureTarget {
+                id: format!("balloon:{}", info.config.balloon_id),
+                flush_required: false,
+                control: CaptureControl::Balloon(control),
+            });
+        }
         for info in self.block_manager.iter() {
             let config = &info.config;
             if config.device_type != BlockDeviceType::RawBlock
@@ -650,9 +689,15 @@ mod tests {
         let expected = BTreeMap::from([
             ("block:root/q0".to_string(), true),
             ("net:eth0".to_string(), false),
+            ("balloon:memory".to_string(), false),
         ]);
-        let complete = vec![ack("block:root/q0", true), ack("net:eth0", false)];
+        let complete = vec![
+            ack("block:root/q0", true),
+            ack("net:eth0", false),
+            ack("balloon:memory", false),
+        ];
         validate_acks(&expected, CaptureGeneration(1), &complete).unwrap();
+        assert!(validate_acks(&expected, CaptureGeneration(1), &complete[..2]).is_err());
         assert!(matches!(
             validate_acks(&expected, CaptureGeneration(1), &complete[..1]),
             Err(DeviceCaptureError::Terminal(_))

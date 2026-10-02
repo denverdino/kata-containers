@@ -67,9 +67,13 @@ pub struct DeviceManagerState {
     #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
     #[serde(default)]
     pub fs: Option<FsDeviceMgrState>,
-    // TODO: balloon, virtio-mem, vhost-net and vhost-user-net are not yet
+    /// Balloon config, negotiated features and transport/queue state.
+    #[cfg(feature = "virtio-balloon")]
+    #[serde(default)]
+    pub balloon: Option<crate::device_manager::balloon_dev_mgr::BalloonDeviceMgrState>,
+    // TODO: virtio-mem, vhost-net and vhost-user-net are not yet
     // snapshotted. kata-dragonball does not instantiate them, so template
-    // save/restore currently covers block, virtio-net, vsock and virtio-fs
+    // save/restore currently covers block, virtio-net, vsock, virtio-fs and balloon
     // only; add the remaining device classes here as they are needed.
 }
 

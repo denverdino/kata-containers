@@ -4,6 +4,7 @@
 use dbs_virtio_devices as virtio;
 use serde_derive::{Deserialize, Serialize};
 use slog::{error, info};
+use std::sync::Arc;
 use virtio::balloon::{Balloon, BalloonConfig};
 use virtio::Error as VirtioError;
 
@@ -23,6 +24,9 @@ const USE_GENERIC_IRQ: bool = false;
 /// Errors associated with `BalloonDeviceConfig`.
 #[derive(Debug, thiserror::Error)]
 pub enum BalloonDeviceError {
+    /// Invalid or unsupported balloon snapshot state.
+    #[error("balloon snapshot error: {0}")]
+    Snapshot(#[source] VirtioError),
     /// The balloon device was already used.
     #[error("the virtio-balloon ID was already added to a different device")]
     BalloonDeviceAlreadyExists,
@@ -198,6 +202,7 @@ impl BalloonDeviceMgr {
                     balloon_cfg.use_generic_irq.unwrap_or(USE_GENERIC_IRQ),
                 )
                 .map_err(BalloonDeviceError::CreateMmioDevice)?;
+            #[cfg(feature = "hotplug")]
             ctx.insert_hotplug_mmio_device(&mmio_dev, None)
                 .map_err(|e| {
                     error!(
@@ -231,7 +236,7 @@ impl BalloonDeviceMgr {
             #[cfg(target_arch = "x86_64")]
             let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
 
-            let device = Balloon::new(
+            let mut device = Balloon::new(
                 epoll_mgr.clone(),
                 BalloonConfig {
                     f_deflate_on_oom: info.config.f_deflate_on_oom,
@@ -240,6 +245,22 @@ impl BalloonDeviceMgr {
                 f_access_platform,
             )
             .map_err(BalloonDeviceError::CreateBalloonDevice)?;
+            if cfg!(target_arch = "x86_64")
+                && !f_access_platform
+                && ctx
+                    .vm_config
+                    .as_ref()
+                    .is_some_and(|config| config.mem_type == "shmem")
+            {
+                device
+                    .set_capture_memory(
+                        format!("balloon:{}", info.config.balloon_id),
+                        Arc::new(crate::address_space_manager::PrivateMemoryReclaimer::new(
+                            ctx.get_vm_as().map_err(BalloonDeviceError::DeviceManager)?,
+                        )),
+                    )
+                    .map_err(BalloonDeviceError::CreateBalloonDevice)?;
+            }
             METRICS
                 .write()
                 .unwrap()
@@ -287,6 +308,71 @@ impl BalloonDeviceMgr {
         self.info_list
             .iter()
             .position(|info| info.config.balloon_id.eq(balloon_id))
+    }
+}
+
+/// Persisted balloon inventory, including its runtime and MMIO queue state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BalloonDeviceMgrState {
+    /// Configured balloons in stable device-ID order.
+    pub devices:
+        Vec<super::persist::VirtioDevState<BalloonDeviceConfigInfo, virtio::balloon::BalloonState>>,
+}
+
+impl<'a> dbs_snapshot::Persist<'a> for BalloonDeviceMgr {
+    type State = BalloonDeviceMgrState;
+    type SaveArgs = ();
+    type RestoreArgs = ();
+    type Error = BalloonDeviceError;
+
+    fn save_state(&mut self, _: ()) -> std::result::Result<Self::State, Self::Error> {
+        let mut devices = Vec::new();
+        for info in self.info_list.iter() {
+            let device = info.device.as_ref().ok_or(BalloonDeviceError::NotExist)?;
+            let (device_info, transport) =
+                super::persist::save_device_state::<Balloon<GuestAddressSpaceImpl>>(device, ())
+                    .map_err(BalloonDeviceError::Snapshot)?;
+            devices.push(super::persist::VirtioDevState {
+                config: info.config.clone(),
+                device_info,
+                transport,
+            });
+        }
+        Ok(BalloonDeviceMgrState { devices })
+    }
+
+    fn restore_state(
+        &mut self,
+        state: &Self::State,
+        _: (),
+    ) -> std::result::Result<(), Self::Error> {
+        if state.devices.len() != self.info_list.len() {
+            return Err(BalloonDeviceError::NotExist);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for saved in &state.devices {
+            let info = self
+                .info_list
+                .iter()
+                .find(|info| info.config.balloon_id == saved.config.balloon_id)
+                .ok_or_else(|| {
+                    BalloonDeviceError::InvalidDeviceId(saved.config.balloon_id.clone())
+                })?;
+            if !seen.insert(&saved.config.balloon_id)
+                || info.config.f_reporting != saved.config.f_reporting
+                || info.config.f_deflate_on_oom != saved.config.f_deflate_on_oom
+            {
+                return Err(BalloonDeviceError::Snapshot(VirtioError::InvalidInput));
+            }
+            super::persist::restore_device_state::<Balloon<GuestAddressSpaceImpl>>(
+                info.device.as_ref().ok_or(BalloonDeviceError::NotExist)?,
+                &saved.device_info,
+                &saved.transport,
+                (),
+            )
+            .map_err(BalloonDeviceError::Snapshot)?;
+        }
+        Ok(())
     }
 }
 

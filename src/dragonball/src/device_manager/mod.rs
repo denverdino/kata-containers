@@ -999,6 +999,11 @@ impl DeviceManager {
             .attach_devices(&mut ctx)
             .map_err(StartMicroVmError::RngDeviceError)?;
 
+        #[cfg(feature = "virtio-balloon")]
+        self.balloon_manager
+            .attach_devices(&mut ctx)
+            .map_err(StartMicroVmError::BalloonDeviceError)?;
+
         #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
         let kernel_config = {
             let mut kernel_config = kernel_config;
