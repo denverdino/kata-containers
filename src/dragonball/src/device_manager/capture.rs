@@ -391,7 +391,7 @@ mod tests {
         epoll: &dbs_utils::epoll_manager::EpollManager,
         id: &str,
     ) -> (
-        Arc<vm_memory::GuestMemoryMmap>,
+        crate::address_space_manager::GuestAddressSpaceImpl,
         Arc<vmm_sys_util::eventfd::EventFd>,
         Arc<dyn DeviceIo>,
     ) {

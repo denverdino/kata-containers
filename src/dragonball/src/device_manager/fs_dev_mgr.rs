@@ -503,9 +503,11 @@ impl FsDeviceMgr {
                 if let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
                     let mut guard = mmio_dev.state();
                     let inner_dev = guard.get_inner_device_mut();
-                    if let Some(virtio_fs_dev) = inner_dev
-                        .as_any_mut()
-                        .downcast_mut::<virtio::fs::VirtioFs<GuestAddressSpaceImpl>>()
+                    if let Some(virtio_fs_dev) =
+                        inner_dev.as_any_mut().downcast_mut::<virtio::fs::VirtioFs<
+                            GuestAddressSpaceImpl,
+                            vm_memory::bitmap::AtomicBitmap,
+                        >>()
                     {
                         return virtio_fs_dev
                             .manipulate_backend_fs(
@@ -557,9 +559,11 @@ impl FsDeviceMgr {
                 if let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
                     let guard = mmio_dev.state();
                     let inner_dev = guard.get_inner_device();
-                    if let Some(fs_dev) = inner_dev
-                        .as_any()
-                        .downcast_ref::<virtio::fs::VirtioFs<GuestAddressSpaceImpl>>()
+                    if let Some(fs_dev) =
+                        inner_dev.as_any().downcast_ref::<virtio::fs::VirtioFs<
+                            GuestAddressSpaceImpl,
+                            vm_memory::bitmap::AtomicBitmap,
+                        >>()
                     {
                         return fs_dev
                             .set_patch_rate_limiters(new_cfg.bytes(), new_cfg.ops())
@@ -604,7 +608,7 @@ impl<'a> dbs_snapshot::Persist<'a> for FsDeviceMgr {
                 });
             }
             let (device_info, transport) = persist::save_device_state::<
-                virtio::fs::VirtioFs<GuestAddressSpaceImpl>,
+                virtio::fs::VirtioFs<GuestAddressSpaceImpl, vm_memory::bitmap::AtomicBitmap>,
             >(device, ())
             .map_err(FsDeviceError::Virtio)?;
             devices.push(persist::VirtioDevState {
@@ -645,12 +649,9 @@ impl<'a> dbs_snapshot::Persist<'a> for FsDeviceMgr {
                 .device
                 .as_ref()
                 .ok_or(FsDeviceError::Virtio(VirtioError::InvalidInput))?;
-            persist::restore_device_state::<virtio::fs::VirtioFs<GuestAddressSpaceImpl>>(
-                device,
-                device_info,
-                &dev_state.transport,
-                (),
-            )
+            persist::restore_device_state::<
+                virtio::fs::VirtioFs<GuestAddressSpaceImpl, vm_memory::bitmap::AtomicBitmap>,
+            >(device, device_info, &dev_state.transport, ())
             .map_err(FsDeviceError::Virtio)?;
         }
         Ok(())

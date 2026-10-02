@@ -31,6 +31,7 @@ use nydus_rafs::{fs::Rafs, RafsIoRead};
 use rlimit::Resource;
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1};
 use virtio_queue::QueueT;
+use vm_memory::bitmap::NewBitmap;
 use vm_memory::{
     FileOffset, GuestAddress, GuestAddressSpace, GuestRegionMmap, GuestUsize, MmapRegion,
 };
@@ -71,7 +72,7 @@ pub struct BackendFsInfo {
 }
 
 /// Virtio device for virtiofs
-pub struct VirtioFs<AS: GuestAddressSpace> {
+pub struct VirtioFs<AS: GuestAddressSpace, B: NewBitmap = ()> {
     pub(crate) device_info: VirtioDeviceInfo,
     pub(crate) cache_size: u64,
     pub(crate) queue_sizes: Arc<Vec<u16>>,
@@ -82,7 +83,7 @@ pub struct VirtioFs<AS: GuestAddressSpace> {
     pub(crate) killpriv_v2: bool,
     pub(crate) no_readdir: bool,
     pub(crate) xattr: bool,
-    pub(crate) handler: Box<dyn VirtioRegionHandler>,
+    pub(crate) handler: Box<dyn VirtioRegionHandler<B>>,
     pub(crate) fs: Arc<Vfs>,
     pub(crate) backend_fs: HashMap<String, BackendFsInfo>,
     pub(crate) subscriber_id: Option<SubscriberId>,
@@ -93,7 +94,7 @@ pub struct VirtioFs<AS: GuestAddressSpace> {
     phantom: PhantomData<AS>,
 }
 
-impl<AS> VirtioFs<AS>
+impl<AS, B: NewBitmap> VirtioFs<AS, B>
 where
     AS: GuestAddressSpace + 'static,
 {
@@ -121,7 +122,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-impl<AS: GuestAddressSpace> VirtioFs<AS> {
+impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
     /// Create a new virtiofs device.
     pub fn new(
         tag: &str,
@@ -136,7 +137,7 @@ impl<AS: GuestAddressSpace> VirtioFs<AS> {
         xattr: bool,
         drop_sys_resource: bool,
         no_readdir: bool,
-        handler: Box<dyn VirtioRegionHandler>,
+        handler: Box<dyn VirtioRegionHandler<B>>,
         epoll_mgr: EpollManager,
         rate_limiter: Option<RateLimiter>,
         f_access_platform: bool,
@@ -575,7 +576,7 @@ impl<AS: GuestAddressSpace> VirtioFs<AS> {
         guest_addr: u64,
         len: u64,
         slot_res: &[u32],
-    ) -> Result<Arc<GuestRegionMmap>> {
+    ) -> Result<Arc<GuestRegionMmap<B>>> {
         // Create file backend for virtiofs's mmap region to let goku and
         // vhost-user slave can remap memory by memfd. However, this is not a
         // complete solution, because when dax is actually on, they need to be
@@ -733,7 +734,9 @@ fn set_default_rlimit_nofile() -> Result<()> {
     }
 }
 
-impl<'a, AS: GuestAddressSpace> crate::persist::VirtioDevicePersist<'a> for VirtioFs<AS> {
+impl<'a, AS: GuestAddressSpace, B: NewBitmap> crate::persist::VirtioDevicePersist<'a>
+    for VirtioFs<AS, B>
+{
     type State = crate::persist::VirtioDeviceInfoState;
     type SaveArgs = ();
     type RestoreArgs = ();
@@ -756,7 +759,8 @@ impl<'a, AS: GuestAddressSpace> crate::persist::VirtioDevicePersist<'a> for Virt
     }
 }
 
-impl<AS, Q> VirtioDevice<AS, Q, GuestRegionMmap> for VirtioFs<AS>
+impl<AS, Q, B: NewBitmap + Send + Sync + 'static> VirtioDevice<AS, Q, GuestRegionMmap<B>>
+    for VirtioFs<AS, B>
 where
     AS: 'static + GuestAddressSpace + Clone + Send + Sync,
     AS::T: Send,
@@ -808,7 +812,10 @@ where
         self.device_info.write_config(offset, data)
     }
 
-    fn activate(&mut self, config: VirtioDeviceConfig<AS, Q>) -> ActivateResult {
+    fn activate(
+        &mut self,
+        config: VirtioDeviceConfig<AS, Q, GuestRegionMmap<B>>,
+    ) -> ActivateResult {
         trace!(
             target: VIRTIO_FS_NAME,
             "{}: VirtioDevice::activate()",
@@ -898,7 +905,7 @@ where
         &mut self,
         vm_fd: Arc<VmFd>,
         resource: DeviceResources,
-    ) -> Result<Option<VirtioSharedMemoryList<GuestRegionMmap>>> {
+    ) -> Result<Option<VirtioSharedMemoryList<GuestRegionMmap<B>>>> {
         trace!(
             target: VIRTIO_FS_NAME,
             "{}: VirtioDevice::set_resource()",

@@ -1154,6 +1154,15 @@ mod tests {
     fn create_net_epoll_handler(id: String) -> NetEpollHandler<Arc<GuestMemoryMmap>> {
         let next_ip = NEXT_IP.fetch_add(1, Ordering::SeqCst);
         let tap = Tap::open_named(&format!("tap{next_ip}"), false).unwrap();
+        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x10000)]).unwrap());
+        create_net_epoll_handler_with_memory(id, mem, tap)
+    }
+
+    fn create_net_epoll_handler_with_memory<AS: DbsGuestAddressSpace>(
+        id: String,
+        mem: AS,
+        tap: Tap,
+    ) -> NetEpollHandler<AS> {
         let rx = RxVirtio::new(
             VirtioQueueConfig::create(256, 0).unwrap(),
             RateLimiter::default(),
@@ -1162,7 +1171,6 @@ mod tests {
             VirtioQueueConfig::create(256, 0).unwrap(),
             RateLimiter::default(),
         );
-        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x10000)]).unwrap());
         let queues = vec![VirtioQueueConfig::create(256, 0).unwrap()];
 
         let kvm = Kvm::new().unwrap();
@@ -1220,6 +1228,69 @@ mod tests {
         handler.rx.frame_buf[..64].fill(0xe7);
         handler.rx.bytes_read = 64;
         handler
+    }
+
+    #[test]
+    fn m2_net_rx_and_tx_used_ring_are_dirty() {
+        use crate::memory_tracking::tests::{descriptor, queue};
+        use std::net::UdpSocket;
+        use std::ops::Deref;
+        use std::process::Command;
+        use vm_memory::{
+            bitmap::{AtomicBitmap, Bitmap},
+            GuestMemory,
+        };
+        let host_netns = std::env::var("AENV_M2_HOST_NETNS")
+            .expect("runner must supply its original network namespace");
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::path::PathBuf::from(host_netns),
+            "run this fixture in an isolated network namespace"
+        );
+        let mem = Arc::new(
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
+        let tap = Tap::open_named("m2dirty0", false).unwrap();
+        let mut handler = create_net_epoll_handler_with_memory("m2dirty0".into(), mem.clone(), tap);
+        handler.rx.queue = queue(0, 0);
+        handler.tx.queue = queue(0x3000, 1);
+        descriptor(&*mem, 0, 0, 0x6000, 2048, VIRTQ_DESC_F_WRITE, 0);
+        descriptor(&*mem, 0x3000, 0, 0x7000, 64, 0, 0);
+        for base in [0x1000, 0x4000] {
+            mem.write_obj(0u16, GuestAddress(base + 4)).unwrap();
+            mem.write_obj(1u16, GuestAddress(base + 2)).unwrap();
+        }
+        handler.tap.enable().unwrap();
+        assert!(Command::new("ip")
+            .args(["addr", "add", "192.0.2.1/24", "dev", "m2dirty0"])
+            .status()
+            .unwrap()
+            .success());
+        let bitmap = mem.iter().next().unwrap().deref().bitmap();
+        bitmap.reset();
+        let socket = UdpSocket::bind("192.0.2.1:0").unwrap();
+        socket.send_to(b"dirty-test", "192.0.2.2:9").unwrap();
+        let end = Instant::now() + std::time::Duration::from_secs(3);
+        while mem.read_obj::<u16>(GuestAddress(0x2002)).unwrap() == 0 && Instant::now() < end {
+            handler.process_rx(&*mem).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(0x2002)).unwrap(),
+            1,
+            "real TAP RX must consume the receive queue"
+        );
+        assert!(mem.read_obj::<u32>(GuestAddress(0x2008)).unwrap() >= 14);
+        handler.process_tx(&*mem).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x5002)).unwrap(), 1);
+        let dirty: Vec<_> = (0..16)
+            .filter(|page| bitmap.dirty_at(page * 4096))
+            .collect();
+        assert_eq!(
+            dirty,
+            vec![2, 5, 6],
+            "only RX payload and both used rings may be dirty"
+        );
     }
 
     #[test]

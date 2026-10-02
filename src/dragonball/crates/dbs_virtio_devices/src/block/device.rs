@@ -1296,6 +1296,13 @@ mod tests {
         file: DummyFile,
     ) -> InnerBlockEpollHandler<Arc<GuestMemoryMmap>, QueueSync> {
         let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x10000)]).unwrap());
+        get_block_epoll_handler_with_memory(file, mem)
+    }
+
+    fn get_block_epoll_handler_with_memory<AS: DbsGuestAddressSpace>(
+        file: DummyFile,
+        mem: AS,
+    ) -> InnerBlockEpollHandler<AS, QueueSync> {
         let queue = VirtioQueueConfig::create(256, 0).unwrap();
         let rate_limiter = RateLimiter::default();
         let disk_image: Box<dyn Ufile> = Box::new(file);
@@ -1847,6 +1854,70 @@ mod tests {
             ),
             Err(CaptureError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn m2_aio_read_marks_payload_status_and_used_ring() {
+        use crate::memory_tracking::tests::{descriptor, queue};
+        use std::ops::Deref;
+        use vm_memory::{
+            bitmap::{AtomicBitmap, Bitmap},
+            GuestMemory,
+        };
+        let mem = Arc::new(
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
+        let mut dummy = DummyFile::new();
+        dummy.capacity = 4096;
+        let mut handler = get_block_epoll_handler_with_memory(dummy, mem.clone());
+        handler.queue = queue(0, 0);
+        descriptor(&*mem, 0, 0, 0x3000, 16, VIRTQ_DESC_F_NEXT, 1);
+        descriptor(
+            &*mem,
+            0,
+            1,
+            0x4000,
+            512,
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            2,
+        );
+        descriptor(&*mem, 0, 2, 0x5000, 1, VIRTQ_DESC_F_WRITE, 0);
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(0x3000))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(0x1004)).unwrap();
+        mem.write_obj(1u16, GuestAddress(0x1002)).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        file.write_all_at(&[0x6d; 512], 0).unwrap();
+        let aio = Aio::new(file.as_raw_fd(), 16).unwrap();
+        handler.disk_image = Box::new(LocalFile::new(file, false, aio).unwrap());
+        let bitmap = mem.iter().next().unwrap().deref().bitmap();
+        bitmap.reset(); // Only discard fixture setup writes, never production history.
+        assert!(!handler.process_queue());
+        assert_eq!(
+            handler.pending_req_map.len(),
+            1,
+            "must execute real AIO, not sync fallback"
+        );
+        let end = Instant::now() + Duration::from_secs(3);
+        while !handler.pending_req_map.is_empty() && Instant::now() < end {
+            handler.io_complete().unwrap();
+            thread::yield_now();
+        }
+        assert!(handler.pending_req_map.is_empty());
+        let mut payload = [0; 512];
+        mem.read_slice(&mut payload, GuestAddress(0x4000)).unwrap();
+        assert_eq!(payload, [0x6d; 512]);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x5000)).unwrap(), 0);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x2002)).unwrap(), 1);
+        assert!(bitmap.dirty_at(0x4000), "raw AIO payload must be marked");
+        assert!(bitmap.dirty_at(0x5000), "status must be marked");
+        assert!(bitmap.dirty_at(0x2000), "used ring must be marked");
+        assert!(
+            !bitmap.dirty_at(0x3000),
+            "read-only request header must stay clean"
+        );
+        assert!(!bitmap.dirty_at(0x6000), "unrelated RAM must stay clean");
     }
 
     #[test]

@@ -45,7 +45,7 @@ timerfd = "1.0"
 vhost-rs = { optional = true, package = "vhost", version = "0.15.0" }
 virtio-bindings = { workspace = true }
 virtio-queue = { workspace = true }
-vm-memory = { features = ["backend-mmap"], workspace = true }
+vm-memory = { features = ["backend-mmap", "backend-bitmap"], workspace = true }
 vmm-sys-util = { workspace = true }
 
 [dev-dependencies]

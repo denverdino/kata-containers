@@ -70,6 +70,11 @@ impl MemoryTracker {
         let page = image_offset / 4096;
         self.words[(page / 64) as usize] & (1 << (page % 64)) != 0
     }
+
+    pub(crate) fn mark_page(&mut self, image_offset: u64) {
+        let page = image_offset / 4096;
+        self.words[(page / 64) as usize] |= 1 << (page % 64);
+    }
 }
 
 pub(crate) fn push_page(ranges: &mut Vec<MemoryRange>, offset: u64) {

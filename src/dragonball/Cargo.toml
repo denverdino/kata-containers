@@ -51,7 +51,7 @@ tracing = "0.1.41"
 vfio-bindings = { optional = true, workspace = true }
 vfio-ioctls = { optional = true, workspace = true }
 virtio-queue = { optional = true, workspace = true }
-vm-memory = { features = ["backend-mmap"], workspace = true }
+vm-memory = { features = ["backend-mmap", "backend-bitmap"], workspace = true }
 vmm-sys-util = { features = ["with-serde"], workspace = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

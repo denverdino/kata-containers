@@ -6,7 +6,7 @@
 use super::TdvfError;
 use crate::firmware::*;
 
-use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory};
 
 /// HOB Type
 #[repr(u16)]
@@ -262,9 +262,9 @@ impl TdHob {
     }
 
     /// Add resource to HOB list
-    fn add_resource(
+    fn add_resource<M: GuestMemory + ?Sized>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &M,
         physical_start: u64,
         resource_length: u64,
         resource_type: u32,
@@ -295,7 +295,7 @@ impl TdHob {
     }
 
     /// Finish writing HOB list
-    pub fn finish(&mut self, mem: &GuestMemoryMmap) -> Result<(), TdvfError> {
+    pub fn finish<M: GuestMemory + ?Sized>(&mut self, mem: &M) -> Result<(), TdvfError> {
         // Write end
         let end = HobEnd::new();
         mem.write_obj(end, GuestAddress(self.current_offset))
@@ -310,9 +310,9 @@ impl TdHob {
     }
 
     /// Add memory resource
-    pub fn add_memory_resource(
+    pub fn add_memory_resource<M: GuestMemory + ?Sized>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &M,
         physical_start: u64,
         resource_length: u64,
         ram: bool,
@@ -333,9 +333,9 @@ impl TdHob {
     }
 
     /// Add mmio resource
-    pub fn add_mmio_resource(
+    pub fn add_mmio_resource<M: GuestMemory + ?Sized>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &M,
         physical_start: u64,
         resource_length: u64,
     ) -> Result<(), TdvfError> {
@@ -351,9 +351,9 @@ impl TdHob {
     }
 
     /// Add payload
-    pub fn add_payload(
+    pub fn add_payload<M: GuestMemory + ?Sized>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &M,
         payload_info: PayloadInfo,
     ) -> Result<(), TdvfError> {
         let payload = TdPayloadDescription::new(payload_info);
@@ -364,9 +364,9 @@ impl TdHob {
     }
 
     /// Add ACPI table
-    pub fn add_acpi_table(
+    pub fn add_acpi_table<M: GuestMemory + ?Sized>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &M,
         table_content: &[u8],
     ) -> Result<(), TdvfError> {
         // We already know the HobGuidType size is 8 bytes multiple, but we

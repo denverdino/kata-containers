@@ -327,9 +327,9 @@ impl<R: GuestMemoryRegion> Clone for VirtioSharedMemoryList<R> {
 /// vm_as. This trait should be implemented in VMM when creating virtio
 /// devices with device memory, because the virtio device does not have
 /// permission to change vm_as.
-pub trait VirtioRegionHandler: Send {
+pub trait VirtioRegionHandler<B: vm_memory::bitmap::Bitmap = ()>: Send {
     /// Insert GuestRegionMmap to vm_as & address_space.
-    fn insert_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<()>;
+    fn insert_region(&mut self, region: Arc<GuestRegionMmap<B>>) -> Result<()>;
 }
 
 /// Trait for Virtio transport layer to manage virtio devices.

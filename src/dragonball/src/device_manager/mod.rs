@@ -65,7 +65,7 @@ use crate::vm::{KernelConfigInfo, Vm, VmConfigInfo};
 use crate::IoManagerCached;
 
 #[cfg(feature = "host-device")]
-use vm_memory::GuestRegionMmap;
+use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
 
 /// Virtual machine console device manager.
 pub mod console_manager;
@@ -227,13 +227,20 @@ pub type Result<T> = ::std::result::Result<T, DeviceMgrError>;
 /// Type of the dragonball virtio devices.
 #[cfg(feature = "dbs-virtio-devices")]
 pub type DbsVirtioDevice = Box<
-    dyn VirtioDevice<GuestAddressSpaceImpl, virtio_queue::QueueSync, vm_memory::GuestRegionMmap>,
+    dyn VirtioDevice<
+        GuestAddressSpaceImpl,
+        virtio_queue::QueueSync,
+        crate::address_space_manager::GuestRegionImpl,
+    >,
 >;
 
 /// Type of the dragonball virtio mmio devices.
 #[cfg(feature = "dbs-virtio-devices")]
-pub type DbsMmioV2Device =
-    MmioV2Device<GuestAddressSpaceImpl, virtio_queue::QueueSync, vm_memory::GuestRegionMmap>;
+pub type DbsMmioV2Device = MmioV2Device<
+    GuestAddressSpaceImpl,
+    virtio_queue::QueueSync,
+    crate::address_space_manager::GuestRegionImpl,
+>;
 
 /// Struct to support transactional operations for device management.
 pub struct DeviceManagerTx {
@@ -1520,8 +1527,8 @@ impl DeviceManager {
         ctx: &mut DeviceOpContext,
         dev_id: u8,
     ) -> std::result::Result<(), DeviceMgrError> {
+        use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
         use virtio_queue::QueueSync;
-        use vm_memory::GuestRegionMmap;
 
         // unregister IoManager
         Self::deregister_virtio_device(&device, ctx)?;
@@ -1613,8 +1620,8 @@ impl DeviceManager {
         }
         #[cfg(feature = "host-device")]
         {
+            use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
             use virtio_queue::QueueSync;
-            use vm_memory::GuestRegionMmap;
             if let Some(pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
                 GuestAddressSpaceImpl,
                 QueueSync,
@@ -1869,8 +1876,9 @@ mod tests {
         )
         .unwrap();
 
-        let guest_mmap_region =
-            Arc::new(vm_memory::GuestRegionMmap::new(mmap_region, guest_addr).unwrap());
+        let guest_mmap_region = Arc::new(
+            crate::address_space_manager::GuestRegionImpl::new(mmap_region, guest_addr).unwrap(),
+        );
 
         let mut handler = DeviceVirtioRegionHandler {
             vm_as: ctx.get_vm_as().unwrap(),
