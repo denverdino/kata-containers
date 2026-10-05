@@ -1867,7 +1867,7 @@ mod tests {
                     queue_size: 256,
                     use_shared_irq: None,
                     use_generic_irq: None,
-                    use_pci_bus: Some(true),
+                    use_pci_bus: Some(cfg!(feature = "host-device")),
                 }),
                 InstanceState::Uninitialized,
                 &|result| {
@@ -1939,21 +1939,32 @@ mod tests {
                     assert_eq!(err_string, expected_err);
                 },
             ),
-            // invalid id
+            // Removal is unavailable without hotplug, even before boot.
             TestData::new(
                 VmmAction::RemoveBlockDevice(String::from("1")),
                 InstanceState::Uninitialized,
                 &|result| {
-                    assert!(matches!(
-                        result,
-                        Err(VmmActionError::Block(BlockDeviceError::InvalidDeviceId(_)))
-                    ));
-                    let err_string = format!("{}", result.unwrap_err());
-                    let expected_err = String::from(
-                        "virtio-blk device error: \
-                    invalid block device id '1'",
-                    );
-                    assert_eq!(err_string, expected_err);
+                    if cfg!(feature = "hotplug") {
+                        assert!(matches!(
+                            result,
+                            Err(VmmActionError::Block(BlockDeviceError::InvalidDeviceId(_)))
+                        ));
+                        assert_eq!(
+                            result.unwrap_err().to_string(),
+                            "virtio-blk device error: invalid block device id '1'"
+                        );
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(VmmActionError::Block(
+                                BlockDeviceError::UpdateNotAllowedPostBoot
+                            ))
+                        ));
+                        assert_eq!(
+                            result.unwrap_err().to_string(),
+                            "virtio-blk device error: block device does not support runtime update"
+                        );
+                    }
                 },
             ),
         ];
