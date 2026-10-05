@@ -1507,6 +1507,34 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "host-device"))]
+    #[test]
+    fn test_insert_pci_block_device_without_host_device_preserves_config() {
+        skip_if_kvm_unaccessable!();
+        let dummy_file = TempFile::new().unwrap();
+        let mut vm = crate::vm::tests::create_vm_instance();
+        let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+        let (sender, _receiver) = channel();
+        let config = BlockDeviceConfigInfo {
+            drive_id: "pci-root".into(),
+            path_on_host: dummy_file.as_path().to_owned(),
+            is_root_device: true,
+            use_pci_bus: Some(true),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            vm.device_manager_mut()
+                .block_manager
+                .insert_device(ctx, config, sender),
+            Err(BlockDeviceError::DeviceManager(
+                DeviceMgrError::InvalidOperation
+            ))
+        ));
+        assert!(vm.device_manager().block_manager.info_list.is_empty());
+        assert!(!vm.device_manager().block_manager.has_root_block_device());
+    }
+
     #[test]
     fn test_add_non_root_block_device() {
         skip_if_kvm_unaccessable!();
@@ -1530,7 +1558,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1610,7 +1638,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
         let (sender, _receiver) = channel();
@@ -1692,7 +1720,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1738,7 +1766,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1761,7 +1789,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1803,7 +1831,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1826,7 +1854,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1849,7 +1877,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1914,7 +1942,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1937,7 +1965,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -1960,7 +1988,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -2026,7 +2054,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -2049,7 +2077,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
 
@@ -2150,7 +2178,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
         let root_block_device_new = BlockDeviceConfigInfo {
@@ -2170,7 +2198,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(true),
+            use_pci_bus: Some(cfg!(feature = "host-device")),
             serial: None,
         };
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
