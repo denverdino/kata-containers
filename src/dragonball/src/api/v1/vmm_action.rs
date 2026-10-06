@@ -2080,7 +2080,7 @@ mod tests {
 
         let tests = &mut [
             // hotplug unready
-            #[cfg(feature = "hotplug")]
+            #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
             TestData::new(
                 VmmAction::InsertNetworkDevice(named()),
                 InstanceState::Running,
@@ -2097,6 +2097,19 @@ mod tests {
                         the upcall client needs a virtio-vsock device for communication",
                     );
                     assert_eq!(err_string, expected_err);
+                },
+            ),
+            #[cfg(not(all(feature = "hotplug", feature = "dbs-upcall")))]
+            TestData::new(
+                VmmAction::InsertNetworkDevice(named()),
+                InstanceState::Running,
+                &|result| {
+                    assert!(matches!(
+                        result,
+                        Err(VmmActionError::Network(
+                            NetworkDeviceError::UpdateNotAllowedPostBoot
+                        ))
+                    ));
                 },
             ),
             // success

@@ -24,8 +24,10 @@ use dbs_device::resources::Resource::LegacyIrq;
 use dbs_device::resources::{DeviceResources, Resource, ResourceConstraint};
 use dbs_device::DeviceIo;
 use dbs_pci::{VfioPciDevice, VENDOR_NVIDIA};
+#[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
 use dbs_upcall::{DevMgrResponse, UpcallClientResponse};
 use kvm_ioctls::{DeviceFd, VmFd};
+#[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
 use log::{debug, error};
 use serde_derive::{Deserialize, Serialize};
 use vfio_ioctls::{VfioContainer, VfioDevice};
@@ -258,7 +260,7 @@ impl VfioDeviceMgr {
         ctx: &mut DeviceOpContext,
         config: &mut HostDeviceConfig,
     ) -> Result<()> {
-        if !cfg!(feature = "hotplug") && ctx.is_hotplug {
+        if !cfg!(all(feature = "hotplug", feature = "dbs-upcall")) && ctx.is_hotplug {
             return Err(VfioDeviceError::UpdateNotAllowedPostBoot);
         }
         slog::info!(
@@ -268,8 +270,9 @@ impl VfioDeviceMgr {
             "hostdev_id" => &config.hostdev_id,
             "bdf" => &config.dev_config.bus_slot_func,
         );
-        let device_index = self.info_list.insert_or_update(config)?;
+        let _device_index = self.info_list.insert_or_update(config)?;
         // Handle device hotplug case
+        #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
         if ctx.is_hotplug {
             slog::info!(
                 ctx.logger(),
@@ -278,7 +281,7 @@ impl VfioDeviceMgr {
                 "hostdev_id" => &config.hostdev_id,
                 "bdf" => &config.dev_config.bus_slot_func,
             );
-            self.add_device(ctx, config, device_index)?;
+            self.add_device(ctx, config, _device_index)?;
         }
 
         Ok(())
@@ -325,46 +328,50 @@ impl VfioDeviceMgr {
         hostdev_id: &str,
         result_sender: Sender<Option<i32>>,
     ) -> Result<()> {
-        if !cfg!(feature = "hotplug") {
-            return Err(VfioDeviceError::UpdateNotAllowedPostBoot);
+        #[cfg(not(all(feature = "hotplug", feature = "dbs-upcall")))]
+        {
+            let _ = (ctx, hostdev_id, result_sender);
+            Err(VfioDeviceError::UpdateNotAllowedPostBoot)
         }
+        #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
+        {
+            slog::info!(
+                ctx.logger(),
+                "prepare remove VFIO device";
+                "subsystem" => "vfio_dev_mgr",
+                "hostdev_id" => hostdev_id,
+            );
 
-        slog::info!(
-            ctx.logger(),
-            "prepare remove VFIO device";
-            "subsystem" => "vfio_dev_mgr",
-            "hostdev_id" => hostdev_id,
-        );
+            let device_index = self
+                .get_index_of_hostdev_id(hostdev_id)
+                .ok_or(VfioDeviceError::InvalidConfig)?;
 
-        let device_index = self
-            .get_index_of_hostdev_id(hostdev_id)
-            .ok_or(VfioDeviceError::InvalidConfig)?;
-
-        let info = &self.info_list[device_index];
-        if let Some(dev) = info.device.as_ref() {
-            let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
-                Some(Box::new(move |result| match result {
-                    UpcallClientResponse::DevMgr(response) => {
-                        if let DevMgrResponse::Other(resp) = response {
-                            if let Err(e) = result_sender.send(Some(resp.result)) {
+            let info = &self.info_list[device_index];
+            if let Some(dev) = info.device.as_ref() {
+                let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                    Some(Box::new(move |result| match result {
+                        UpcallClientResponse::DevMgr(response) => {
+                            if let DevMgrResponse::Other(resp) = response {
+                                if let Err(e) = result_sender.send(Some(resp.result)) {
+                                    error!("send upcall result failed, due to {e:?}!");
+                                }
+                            }
+                        }
+                        UpcallClientResponse::UpcallReset => {
+                            if let Err(e) = result_sender.send(None) {
                                 error!("send upcall result failed, due to {e:?}!");
                             }
                         }
-                    }
-                    UpcallClientResponse::UpcallReset => {
-                        if let Err(e) = result_sender.send(None) {
-                            error!("send upcall result failed, due to {e:?}!");
+                        #[allow(unreachable_patterns)]
+                        _ => {
+                            debug!("this arm should only be triggered under test");
                         }
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => {
-                        debug!("this arm should only be triggered under test");
-                    }
-                }));
-            ctx.remove_hotplug_pci_device(dev, callback)
-                .map_err(VfioDeviceError::VfioDeviceMgr)?
+                    }));
+                ctx.remove_hotplug_pci_device(dev, callback)
+                    .map_err(VfioDeviceError::VfioDeviceMgr)?
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn remove_vfio_device(
@@ -427,6 +434,7 @@ impl VfioDeviceMgr {
         Ok(device)
     }
 
+    #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
     fn add_device(
         &mut self,
         ctx: &mut DeviceOpContext,
@@ -692,6 +700,44 @@ impl VfioDeviceMgr {
     /// Get the PCI manager to support PCI device passthrough
     pub fn get_pci_manager(&mut self) -> Arc<Mutex<PciSystemManager>> {
         self.pci_system_manager.clone()
+    }
+}
+
+#[cfg(all(test, not(all(feature = "hotplug", feature = "dbs-upcall"))))]
+mod no_upcall_tests {
+    use super::*;
+    use crate::device_manager::DeviceManager;
+    use test_utils::skip_if_kvm_unaccessable;
+
+    #[test]
+    fn test_vfio_hotplug_rejected_before_config_mutation() {
+        skip_if_kvm_unaccessable!();
+        let mgr = DeviceManager::new_test_mgr();
+        let mut ctx =
+            DeviceOpContext::new(None, &mgr, None, None, false, None, mgr.shared_info.clone());
+        let mut vfio = mgr.vfio_manager.lock().unwrap();
+        let mut config = HostDeviceConfig {
+            hostdev_id: "boot-device".to_owned(),
+            ..Default::default()
+        };
+        // Boot-time configuration must remain available without upcall.
+        vfio.insert_device(&mut ctx, &mut config).unwrap();
+        let original = config.clone();
+        ctx.is_hotplug = true;
+        config.sysfs_path = "/nonexistent-vfio-device".to_owned();
+        assert!(matches!(
+            vfio.insert_device(&mut ctx, &mut config),
+            Err(VfioDeviceError::UpdateNotAllowedPostBoot)
+        ));
+        assert_eq!(vfio.info_list.len(), 1);
+        assert_eq!(vfio.info_list[0].config, original);
+        assert!(vfio.info_list[0].device.is_none());
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        assert!(matches!(
+            vfio.prepare_remove_device(&ctx, &config.hostdev_id, sender),
+            Err(VfioDeviceError::UpdateNotAllowedPostBoot)
+        ));
+        assert_eq!(vfio.info_list[0].config, original);
     }
 }
 
