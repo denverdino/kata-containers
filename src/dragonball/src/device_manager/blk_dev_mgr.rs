@@ -31,10 +31,10 @@ use dbs_virtio_devices::vhost::vhost_user::block::VhostUserBlock;
 use serde_derive::{Deserialize, Serialize};
 #[cfg(feature = "host-device")]
 use virtio_queue::QueueSync;
-#[cfg(feature = "host-device")]
-use vm_memory::GuestRegionMmap;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
+#[cfg(feature = "host-device")]
+use crate::address_space_manager::GuestRegionImpl as GuestRegionMmap;
 #[cfg(target_arch = "x86_64")]
 use crate::api::v1::ConfidentialVmType;
 use crate::config_manager::{ConfigItem, DeviceConfigInfo, RateLimiterConfigInfo};
@@ -1603,9 +1603,9 @@ mod tests {
             .is_some());
     }
 
-    #[test]
-    fn test_update_blk_device_ratelimiters() {
-        skip_if_kvm_unaccessable!();
+    fn attached_block_device_for_test(
+        use_pci_bus: bool,
+    ) -> (crate::vm::Vm, DeviceOpContext, TempFile) {
         //Init vm for test.
         let mut vm = create_vm_for_test();
         let device_op_ctx = DeviceOpContext::new(
@@ -1638,7 +1638,7 @@ mod tests {
             queue_size: 128,
             use_shared_irq: None,
             use_generic_irq: None,
-            use_pci_bus: Some(cfg!(feature = "host-device")),
+            use_pci_bus: Some(use_pci_bus),
             serial: None,
         };
         let (sender, _receiver) = channel();
@@ -1646,11 +1646,6 @@ mod tests {
             .block_manager
             .insert_device(device_op_ctx, dummy_block_device, sender)
             .unwrap();
-
-        let cfg = BlockDeviceConfigUpdateInfo {
-            drive_id: String::from("1"),
-            rate_limiter: None,
-        };
 
         let mut device_op_ctx = DeviceOpContext::new(
             Some(vm.epoll_manager().clone()),
@@ -1667,6 +1662,16 @@ mod tests {
             .attach_devices(&mut device_op_ctx)
             .unwrap();
         assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
+
+        (vm, device_op_ctx, dummy_file)
+    }
+
+    fn check_update_blk_device_ratelimiters(use_pci_bus: bool) {
+        let (mut vm, _ctx, _backing) = attached_block_device_for_test(use_pci_bus);
+        let cfg = BlockDeviceConfigUpdateInfo {
+            drive_id: String::from("1"),
+            rate_limiter: None,
+        };
 
         //Patch while the epoll handler is invalid.
         let expected_error = "could not send patch message to the block epoll handler".to_string();
@@ -1696,6 +1701,36 @@ mod tests {
                 .to_string(),
             expected_error
         );
+    }
+
+    #[test]
+    fn test_update_blk_device_ratelimiters() {
+        skip_if_kvm_unaccessable!();
+        check_update_blk_device_ratelimiters(false);
+    }
+
+    #[cfg(feature = "host-device")]
+    #[test]
+    fn test_update_pci_blk_device_ratelimiters() {
+        skip_if_kvm_unaccessable!();
+        check_update_blk_device_ratelimiters(true);
+    }
+
+    #[cfg(all(feature = "host-device", feature = "hotplug", feature = "dbs-upcall"))]
+    #[test]
+    fn test_prepare_pci_block_remove_rejects_boot_context() {
+        skip_if_kvm_unaccessable!();
+        let (vm, ctx, _backing) = attached_block_device_for_test(true);
+        let (sender, _receiver) = channel();
+        assert!(matches!(
+            vm.device_manager()
+                .block_manager
+                .prepare_remove_device(&ctx, "1", sender),
+            Err(BlockDeviceError::DeviceManager(
+                DeviceMgrError::InvalidOperation
+            ))
+        ));
+        assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
     }
 
     #[test]
