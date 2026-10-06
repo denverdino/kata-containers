@@ -514,7 +514,7 @@ impl DeviceOpContext {
 impl DeviceOpContext {
     pub(crate) fn insert_hotplug_mmio_device(
         &self,
-        _dev: &Arc<DbsMmioV2Device>,
+        _dev: &Arc<dyn DeviceIo>,
         _callback: Option<()>,
     ) -> Result<()> {
         Err(DeviceMgrError::InvalidOperation)
@@ -522,7 +522,7 @@ impl DeviceOpContext {
 
     pub(crate) fn remove_hotplug_mmio_device(
         &self,
-        _dev: &Arc<DbsMmioV2Device>,
+        _dev: &Arc<dyn DeviceIo>,
         _callback: Option<()>,
     ) -> Result<()> {
         Err(DeviceMgrError::InvalidOperation)

@@ -1322,7 +1322,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use dbs_utils::epoll_manager::EpollManager;
-    #[cfg(feature = "hotplug")]
+    #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
     use dbs_virtio_devices::vsock::backend::VsockInnerBackend;
     use seccompiler::BpfProgram;
     use serial_test::serial;
@@ -1706,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hotplug")]
+    #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
     fn test_vcpu_manager_resize_cpu() {
         skip_if_kvm_unaccessable!();
         let vm = get_vm();

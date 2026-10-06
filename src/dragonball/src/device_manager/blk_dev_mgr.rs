@@ -1716,6 +1716,26 @@ mod tests {
         check_update_blk_device_ratelimiters(true);
     }
 
+    #[cfg(all(feature = "hotplug", not(feature = "dbs-upcall")))]
+    #[test]
+    fn test_mmio_hotplug_without_upcall_is_rejected() {
+        skip_if_kvm_unaccessable!();
+        let (vm, mut ctx, _backing) = attached_block_device_for_test(false);
+        ctx.is_hotplug = true;
+        let dev = vm.device_manager().block_manager.info_list[0]
+            .device
+            .as_ref()
+            .unwrap();
+        assert!(matches!(
+            ctx.insert_hotplug_mmio_device(dev, None),
+            Err(DeviceMgrError::InvalidOperation)
+        ));
+        assert!(matches!(
+            ctx.remove_hotplug_mmio_device(dev, None),
+            Err(DeviceMgrError::InvalidOperation)
+        ));
+    }
+
     #[cfg(all(feature = "host-device", feature = "hotplug", feature = "dbs-upcall"))]
     #[test]
     fn test_prepare_pci_block_remove_rejects_boot_context() {
