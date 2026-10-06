@@ -205,7 +205,7 @@ impl MemDeviceMgr {
                 )
                 .map_err(MemDeviceError::CreateMmioDevice)?;
 
-            #[cfg(not(test))]
+            #[cfg(all(not(test), feature = "hotplug"))]
             ctx.insert_hotplug_mmio_device(&mmio_device, None)
                 .map_err(|e| {
                     error!(
@@ -676,11 +676,20 @@ mod tests {
         );
 
         let dummy_mem_device = MemDeviceConfigInfo::default();
-        vm.device_manager_mut()
+        let result = vm
+            .device_manager_mut()
             .mem_manager
-            .insert_or_update_device(device_op_ctx, dummy_mem_device)
-            .unwrap();
-        assert_eq!(vm.device_manager().mem_manager.info_list.len(), 1);
+            .insert_or_update_device(device_op_ctx, dummy_mem_device);
+        if cfg!(feature = "hotplug") {
+            result.unwrap();
+            assert_eq!(vm.device_manager().mem_manager.info_list.len(), 1);
+        } else {
+            assert!(matches!(
+                result,
+                Err(MemDeviceError::UpdateNotAllowedPostBoot)
+            ));
+            assert!(vm.device_manager().mem_manager.info_list.is_empty());
+        }
     }
 
     #[test]
