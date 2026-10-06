@@ -653,7 +653,7 @@ impl Vm {
     }
 
     /// Remove upcall client when the VM is destoryed.
-    #[cfg(feature = "dbs-upcall")]
+    #[cfg(all(feature = "hotplug", feature = "dbs-upcall"))]
     pub fn remove_upcall(&mut self) -> std::result::Result<(), StopMicrovmError> {
         self.upcall_client = None;
         Ok(())
