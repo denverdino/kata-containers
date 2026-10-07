@@ -199,6 +199,14 @@ pub enum VmmAction {
         /// Export deadline.
         deadline: std::time::Instant,
     },
+    /// Export the same cumulative changed ranges without zero-page classification.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    ExportHeldMemoryMapWithoutZeroScan {
+        /// Confirmed generation.
+        generation: u64,
+        /// Export deadline.
+        deadline: std::time::Instant,
+    },
     /// Confirm that all external reads of this generation have finished.
     #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
     ReleaseHeldMemoryMap {
@@ -484,6 +492,7 @@ impl VmmService {
                     | VmmAction::ExportHeldSnapshot { .. }
                     | VmmAction::ExportHeldState { .. }
                     | VmmAction::ExportHeldMemoryMap { .. }
+                    | VmmAction::ExportHeldMemoryMapWithoutZeroScan { .. }
                     | VmmAction::ReleaseHeldMemoryMap { .. }
                     | VmmAction::LoadSnapshotHeld { .. }
                     | VmmAction::ShutdownMicroVm
@@ -521,6 +530,18 @@ impl VmmService {
                 .ok_or(VmmActionError::InvalidVMID)
                 .and_then(|vm| {
                     vm.export_held_memory_map(generation, deadline)
+                        .map(VmmData::FrozenMemoryMap)
+                        .map_err(VmmActionError::Capture)
+                }),
+            #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+            VmmAction::ExportHeldMemoryMapWithoutZeroScan {
+                generation,
+                deadline,
+            } => vmm
+                .get_vm_mut()
+                .ok_or(VmmActionError::InvalidVMID)
+                .and_then(|vm| {
+                    vm.export_held_memory_map_without_zero_scan(generation, deadline)
                         .map(VmmData::FrozenMemoryMap)
                         .map_err(VmmActionError::Capture)
                 }),

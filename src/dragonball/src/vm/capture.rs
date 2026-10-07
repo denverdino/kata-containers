@@ -20,7 +20,7 @@ use crate::memory_tracking::FrozenMemoryMap;
 pub(super) struct VmCaptureSession {
     generation: u64,
     report: Option<CaptureReport>,
-    read_map: Option<FrozenMemoryMap>,
+    read_map: Option<(bool, FrozenMemoryMap)>,
 }
 
 fn terminal(error: impl std::fmt::Display) -> CaptureError {
@@ -59,6 +59,25 @@ impl Vm {
         generation: u64,
         deadline: Instant,
     ) -> CaptureResult<FrozenMemoryMap> {
+        self.export_held_memory_map_with_zero_scan(generation, deadline, true)
+    }
+
+    /// Export the same layout and cumulative dirty ranges without reading RAM
+    /// to classify zeros. Consumers must copy changed zero pages explicitly.
+    pub fn export_held_memory_map_without_zero_scan(
+        &mut self,
+        generation: u64,
+        deadline: Instant,
+    ) -> CaptureResult<FrozenMemoryMap> {
+        self.export_held_memory_map_with_zero_scan(generation, deadline, false)
+    }
+
+    fn export_held_memory_map_with_zero_scan(
+        &mut self,
+        generation: u64,
+        deadline: Instant,
+        classify_zeros: bool,
+    ) -> CaptureResult<FrozenMemoryMap> {
         let layout = self
             .held_report(generation, deadline)?
             .memory_layout
@@ -71,19 +90,25 @@ impl Vm {
         {
             return Err(terminal("held memory layout changed"));
         }
-        if let Some(map) = &self.capture_session.as_ref().unwrap().read_map {
-            return Ok(map.clone());
+        if let Some((classified, map)) = &self.capture_session.as_ref().unwrap().read_map {
+            if !classify_zeros || *classified {
+                let mut map = map.clone();
+                if !classify_zeros {
+                    map.zero_ranges.clear();
+                }
+                return Ok(map);
+            }
         }
         let map = self
             .address_space
-            .frozen_memory_map(&self.vm_fd, generation)
+            .frozen_memory_map(&self.vm_fd, generation, classify_zeros)
             .map_err(|e| CaptureError::Export(e.into()))?;
         if Instant::now() >= deadline {
             return Err(CaptureError::Rejected(
                 "memory export deadline expired; session remains held".into(),
             ));
         }
-        self.capture_session.as_mut().unwrap().read_map = Some(map.clone());
+        self.capture_session.as_mut().unwrap().read_map = Some((classify_zeros, map.clone()));
         Ok(map)
     }
 
@@ -1275,6 +1300,45 @@ mod tests {
     }
 
     #[test]
+    fn m2_optional_zero_scan_preserves_ranges_cache_and_pin() {
+        let (mut vm, _real) = paused_counter_vm();
+        let ram = vm.address_space.vm_memory().unwrap();
+        ram.write_slice(&[0u8; 4096], vm_memory::GuestAddress(0x5000))
+            .unwrap();
+        vm.begin_capture(1, deadline()).unwrap();
+        let fast = vm
+            .export_held_memory_map_without_zero_scan(1, deadline())
+            .unwrap();
+        assert!(fast.zero_ranges.is_empty());
+        assert!(fast
+            .changed_ranges
+            .iter()
+            .any(|r| { r.image_offset <= 0x5000 && r.image_offset + r.length > 0x5000 }));
+        assert!(vm.end_capture(1, deadline(), false).is_err());
+        assert!(vm
+            .export_held_memory_map_without_zero_scan(2, deadline())
+            .is_err());
+        let classified = vm.export_held_memory_map(1, deadline()).unwrap();
+        assert_eq!(classified.changed_ranges, fast.changed_ranges);
+        assert_eq!(classified.regions, fast.regions);
+        assert!(classified
+            .zero_ranges
+            .iter()
+            .any(|r| { r.image_offset <= 0x5000 && r.image_offset + r.length > 0x5000 }));
+        let fast_again = vm
+            .export_held_memory_map_without_zero_scan(1, deadline())
+            .unwrap();
+        assert_eq!(fast_again, fast);
+        assert_eq!(
+            vm.export_held_memory_map(1, deadline()).unwrap(),
+            classified
+        );
+        vm.release_held_memory_map(1).unwrap();
+        vm.end_capture(1, deadline(), false).unwrap();
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+    }
+
+    #[test]
     fn m2_actions_preserve_read_pin_and_owned_state_output() {
         use crate::api::v1::{VmmAction, VmmData, VmmService};
         use crate::snapshot::capture::SnapshotStateFile;
@@ -1301,6 +1365,13 @@ mod tests {
                 deadline: deadline()
             }),
             Ok(VmmData::CaptureReport(_))
+        ));
+        assert!(matches!(
+            call(VmmAction::ExportHeldMemoryMapWithoutZeroScan {
+                generation: 1,
+                deadline: deadline()
+            }),
+            Ok(VmmData::FrozenMemoryMap(map)) if map.zero_ranges.is_empty()
         ));
         assert!(matches!(
             call(VmmAction::ExportHeldMemoryMap {
