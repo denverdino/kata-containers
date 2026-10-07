@@ -1063,12 +1063,13 @@ impl AddressSpaceMgr {
         })
     }
 
-    /// Merge KVM pages into the fixed-base history and classify current zero pages.
+    /// Merge KVM pages into the fixed-base history, optionally classifying zero pages.
     #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
     pub(crate) fn frozen_memory_map(
         &mut self,
         vmfd: &VmFd,
         generation: u64,
+        classify_zeros: bool,
     ) -> Result<crate::memory_tracking::FrozenMemoryMap> {
         use crate::memory_tracking::{push_page, FrozenMemoryMap, FrozenMemoryRegion};
         use vm_memory::Bytes;
@@ -1116,13 +1117,18 @@ impl AddressSpaceMgr {
                 }
                 if self.memory_tracker.dirty(image_offset) {
                     push_page(&mut map.changed_ranges, image_offset);
-                    memory
-                        .read_slice(&mut page, GuestAddress(region.guest_addr + offset))
-                        .map_err(|e| {
-                            AddressManagerError::AccessGuestMemory(region.guest_addr + offset, e)
-                        })?;
-                    if page == [0u8; 4096] {
-                        push_page(&mut map.zero_ranges, image_offset);
+                    if classify_zeros {
+                        memory
+                            .read_slice(&mut page, GuestAddress(region.guest_addr + offset))
+                            .map_err(|e| {
+                                AddressManagerError::AccessGuestMemory(
+                                    region.guest_addr + offset,
+                                    e,
+                                )
+                            })?;
+                        if page == [0u8; 4096] {
+                            push_page(&mut map.zero_ranges, image_offset);
+                        }
                     }
                 }
             }
@@ -1817,7 +1823,7 @@ mod tests {
             )
             .unwrap();
         assert!(memory
-            .frozen_memory_map(&vm, 1)
+            .frozen_memory_map(&vm, 1, true)
             .unwrap()
             .changed_ranges
             .is_empty());
@@ -1878,7 +1884,7 @@ mod tests {
             .insert(4u64 << 30, u32::MAX)
             .unwrap();
         assert!(
-            memory.frozen_memory_map(&vm, 2).is_err(),
+            memory.frozen_memory_map(&vm, 2, true).is_err(),
             "later slot failure must not discard the already-read low bitmap"
         );
         memory
@@ -1886,7 +1892,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(4u64 << 30, high_slot);
-        let first = memory.frozen_memory_map(&vm, 2).unwrap();
+        let first = memory.frozen_memory_map(&vm, 2, true).unwrap();
         let contains = |ranges: &[crate::memory_tracking::MemoryRange], offset| {
             ranges.iter().any(|range| {
                 range.image_offset <= offset && range.image_offset + range.length > offset
@@ -1904,12 +1910,15 @@ mod tests {
         );
         ram.write_obj(0u8, GuestAddress((4u64 << 30) + 0x2000))
             .unwrap();
-        let zero = memory.frozen_memory_map(&vm, 3).unwrap();
+        let unclassified = memory.frozen_memory_map(&vm, 3, false).unwrap();
+        assert_eq!(unclassified.changed_ranges, first.changed_ranges);
+        assert!(unclassified.zero_ranges.is_empty());
+        let zero = memory.frozen_memory_map(&vm, 3, true).unwrap();
         assert_eq!(zero.changed_ranges, first.changed_ranges);
         assert!(contains(&zero.zero_ranges, (3u64 << 30) + 0x2000));
         ram.write_obj(0x91u8, GuestAddress((4u64 << 30) + 0x2000))
             .unwrap();
-        let rewritten = memory.frozen_memory_map(&vm, 4).unwrap();
+        let rewritten = memory.frozen_memory_map(&vm, 4, true).unwrap();
         assert!(!contains(&rewritten.zero_ranges, (3u64 << 30) + 0x2000));
         let mut lower = [0];
         file.read_exact_at(&mut lower, (3u64 << 30) + 0x2000)
@@ -1943,7 +1952,7 @@ mod tests {
         ram.write_obj(1u8, GuestAddress(4095)).unwrap();
         ram.write_obj(1u8, GuestAddress((9u64 << 30) - 1)).unwrap();
         let started = std::time::Instant::now();
-        let map = memory.frozen_memory_map(&vm, 1).unwrap();
+        let map = memory.frozen_memory_map(&vm, 1, true).unwrap();
         let elapsed = started.elapsed();
         eprintln!("8 GiB cold memory-map export: {elapsed:?}");
         assert_eq!(map.regions.len(), 2);

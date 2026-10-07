@@ -37,6 +37,7 @@ pub struct FrozenMemoryMap {
     /// Cumulative changes since cold start or the last load.
     pub changed_ranges: Vec<MemoryRange>,
     /// Currently zero pages, always a subset of changed ranges.
+    /// Empty when zero-page classification was not requested.
     pub zero_ranges: Vec<MemoryRange>,
 }
 
