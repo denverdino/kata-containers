@@ -8,7 +8,7 @@ use crate::snapshot::{MicrovmState, SnapshotError};
 use dbs_snapshot::Persist;
 use dbs_virtio_devices::capture::CaptureGeneration;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::sync::{MutexGuard, TryLockError};
 use std::time::Instant;
@@ -538,7 +538,8 @@ impl Vm {
         let mut file = files.state.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
         let value: serde_json::Value =
-            serde_json::from_reader(file).map_err(crate::snapshot::PersistError::from)?;
+            serde_json::from_reader(BufReader::new(file))
+                .map_err(crate::snapshot::PersistError::from)?;
         crate::snapshot::check_epoch(
             value
                 .get("header")
@@ -806,6 +807,41 @@ mod tests {
     use std::time::{Duration, Instant};
     use vm_memory::GuestMemory;
     use vmm_sys_util::tempfile::TempFile;
+
+    #[test]
+    fn held_snapshot_state_reads_are_batched() {
+        // Track this thread only: other parallel tests must not affect the budget.
+        fn read_calls() -> u64 {
+            std::fs::read_to_string("/proc/thread-self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("syscr: "))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let vm = super::super::tests::create_vm_instance();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        memory.as_file().set_len(16 << 20).unwrap();
+        // A complete JSON document with an invalid snapshot header must still
+        // be rejected, without a syscall for every byte of valid whitespace.
+        let mut json = vec![b' '; 64 * 1024];
+        json.extend_from_slice(b"{}");
+        state.as_file().write_all(&json).unwrap();
+        let input = files(&state, &memory);
+        let before = read_calls();
+        let result = vm.read_held_snapshot(&input);
+        let calls = read_calls() - before;
+        eprintln!("held snapshot state: {} bytes, {} read calls", json.len(), calls);
+        assert!(result.is_err(), "invalid snapshot header must be rejected");
+        assert!(
+            calls < 64,
+            "state parser issued {} reads for {} bytes",
+            calls,
+            json.len()
+        );
+    }
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(3)
