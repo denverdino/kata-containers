@@ -436,6 +436,7 @@ impl Vm {
         generation: u64,
         deadline: Instant,
     ) -> CaptureResult<CaptureReport> {
+        let started = Instant::now();
         self.validate_capture_request(generation, deadline)?;
         if self.is_vm_initialized() {
             return Err(CaptureError::Rejected("VM is already initialized".into()));
@@ -458,6 +459,9 @@ impl Vm {
         let state = self
             .read_held_snapshot(files)
             .map_err(|e| CaptureError::Rejected(e.to_string()))?;
+        let decoded_us = started.elapsed().as_micros() as u64;
+        let (mut memory_us, mut vcpu_manager_us, mut devices_us, mut state_us, mut events_us) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
         self.last_capture_generation = generation;
         self.capture_session = Some(VmCaptureSession {
             generation,
@@ -478,6 +482,7 @@ impl Vm {
                 state.memory_state.as_ref().unwrap(),
                 &files.memory,
             )))?;
+            memory_us = started.elapsed().as_micros() as u64;
             let vm_as = self
                 .vm_as()
                 .cloned()
@@ -487,13 +492,17 @@ impl Vm {
                 filters.get(VCPU_THREAD).cloned().unwrap_or_default(),
             )
             .map_err(StartMicroVmError::Vcpu)?;
+            vcpu_manager_us = started.elapsed().as_micros() as u64;
             self.init_microvm_from_snapshot(events.epoll_manager(), vm_as, TimestampUs::default())?;
+            devices_us = started.elapsed().as_micros() as u64;
             self.device_manager
                 .arm_capture_restore(CaptureGeneration(generation))
                 .map_err(|e| StartMicroVmError::RestoreMicroVm(e.to_string()))?;
             self.restore_held_state(&state)
                 .map_err(|e| StartMicroVmError::RestoreMicroVm(e.to_string()))?;
+            state_us = started.elapsed().as_micros() as u64;
             self.register_events(events)?;
+            events_us = started.elapsed().as_micros() as u64;
             self.vcpu_manager()
                 .map_err(StartMicroVmError::Vcpu)?
                 .start_vcpus(
@@ -505,10 +514,12 @@ impl Vm {
             Ok(())
         })();
         restored.map_err(terminal)?;
+        let threads_us = started.elapsed().as_micros() as u64;
         let vcpu_acks = self
             .capture_cpu_manager(deadline)?
             .capture_pause(generation, deadline)
             .map_err(terminal)?;
+        let cpu_held_us = started.elapsed().as_micros() as u64;
         let device_acks = self
             .device_manager
             .begin_capture(CaptureGeneration(generation), deadline)
@@ -522,6 +533,19 @@ impl Vm {
             memory_layout,
         };
         self.capture_session.as_mut().unwrap().report = Some(report.clone());
+        tracing::debug!(
+            generation,
+            decoded_us,
+            memory_us,
+            vcpu_manager_us,
+            devices_us,
+            state_us,
+            events_us,
+            threads_us,
+            cpu_held_us,
+            completed_us = started.elapsed().as_micros() as u64,
+            "Dragonball LoadHeld worker timing (cumulative)"
+        );
         Ok(report)
     }
 
