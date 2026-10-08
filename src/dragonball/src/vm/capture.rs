@@ -537,9 +537,8 @@ impl Vm {
         crate::address_space_manager::inspect_memory_backing(&files.memory)?;
         let mut file = files.state.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
-        let value: serde_json::Value =
-            serde_json::from_reader(BufReader::new(file))
-                .map_err(crate::snapshot::PersistError::from)?;
+        let value: serde_json::Value = serde_json::from_reader(BufReader::new(file))
+            .map_err(crate::snapshot::PersistError::from)?;
         crate::snapshot::check_epoch(
             value
                 .get("header")
@@ -833,7 +832,11 @@ mod tests {
         let before = read_calls();
         let result = vm.read_held_snapshot(&input);
         let calls = read_calls() - before;
-        eprintln!("held snapshot state: {} bytes, {} read calls", json.len(), calls);
+        eprintln!(
+            "held snapshot state: {} bytes, {} read calls",
+            json.len(),
+            calls
+        );
         assert!(result.is_err(), "invalid snapshot header must be rejected");
         assert!(
             calls < 64,
