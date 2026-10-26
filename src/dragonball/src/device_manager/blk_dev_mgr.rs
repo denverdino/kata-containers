@@ -1319,12 +1319,13 @@ impl BlockDeviceMgr {
             let index = match self.get_index_of_drive_id(&dev_state.config.drive_id) {
                 Some(index) if !restored[index] => index,
                 _ if !dev_state.config.is_volume_slot
-                    && self.info_list.len() == state.devices.len() => self
-                    .info_list
-                    .iter()
-                    .enumerate()
-                    .find(|(index, info)| {
-                        !restored[*index]
+                    && self.info_list.len() == state.devices.len() =>
+                {
+                    self.info_list
+                        .iter()
+                        .enumerate()
+                        .find(|(index, info)| {
+                            !restored[*index]
                             // A fallback must not consume a target reserved by
                             // another snapshot entry's exact drive ID.
                             && !exact_targets.contains(index)
@@ -1334,9 +1335,10 @@ impl BlockDeviceMgr {
                             && info.config.is_root_device == dev_state.config.is_root_device
                             && (!dev_state.config.is_read_only
                                 || info.config.path_on_host == dev_state.config.path_on_host)
-                    })
-                    .map(|(index, _)| index)
-                    .ok_or_else(|| InvalidDeviceId(dev_state.config.drive_id.clone()))?,
+                        })
+                        .map(|(index, _)| index)
+                        .ok_or_else(|| InvalidDeviceId(dev_state.config.drive_id.clone()))?
+                }
                 _ => return Err(InvalidDeviceId(dev_state.config.drive_id.clone())),
             };
             if dev_state.config.drive_id != self.info_list[index].config.drive_id {

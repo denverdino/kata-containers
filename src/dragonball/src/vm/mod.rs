@@ -1259,11 +1259,11 @@ impl Vm {
         state_path: &std::path::Path,
         mem_path: &std::path::Path,
         msr_list: &[u32],
-        #[allow(unused_variables)] reset_vsock_transport: bool,
+        reset_vsock_transport: bool,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
         use dbs_snapshot::Persist;
         let vcpu_states = self.vcpu_manager()?.save_state(msr_list)?;
-        let mut state = self.snapshot_metadata_paused(vcpu_states)?;
+        let mut state = self.snapshot_metadata_paused(vcpu_states, reset_vsock_transport)?;
         let mut mem_file = std::fs::File::create(mem_path)?;
         state.memory_state = Some(self.address_space.save_state(&mut mem_file)?);
         state.save_to_file(state_path)?;
@@ -1274,8 +1274,17 @@ impl Vm {
     fn snapshot_metadata_paused(
         &mut self,
         vcpu_states: Vec<crate::vcpu::VcpuState>,
+        #[allow(unused_variables)] reset_vsock_transport: bool,
     ) -> std::result::Result<crate::snapshot::MicrovmState, crate::snapshot::SnapshotError> {
         use crate::snapshot::{DeviceManagerState, MicrovmState, SnapshotError};
+        #[cfg(any(
+            feature = "virtio-blk",
+            feature = "virtio-net",
+            feature = "virtio-balloon",
+            feature = "virtio-vsock",
+            feature = "virtio-fs",
+            feature = "vhost-user-fs"
+        ))]
         use dbs_snapshot::Persist;
 
         // VM-scoped KVM state, captured while the vCPUs are paused.

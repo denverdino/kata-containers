@@ -179,7 +179,7 @@ impl Vm {
             .capture_cpu_manager(deadline)
             .map_err(|e| SnapshotError::InvalidState(e.to_string()))?
             .capture_save(msrs.as_slice(), deadline)?;
-        let mut state = self.snapshot_metadata_paused(states)?;
+        let mut state = self.snapshot_metadata_paused(states, false)?;
         #[cfg(feature = "virtio-vsock")]
         {
             state.device_states.vsock = None;
@@ -1010,7 +1010,7 @@ mod tests {
         drop(memory);
         drop(source);
         let (mut legacy, _legacy_real) = paused_counter_vm();
-        let legacy_result = legacy.restore_microvm(state_file.as_path(), ram_file.as_path());
+        let legacy_result = legacy.restore_microvm(state_file.as_path(), ram_file.as_path(), false);
         legacy.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
         assert!(
             matches!(legacy_result, Err(SnapshotError::InvalidSnapshot(message))
@@ -1662,7 +1662,7 @@ mod tests {
         let state = TempFile::new().unwrap();
         let memory = TempFile::new().unwrap();
         source
-            .save_microvm(state.as_path(), memory.as_path())
+            .save_microvm(state.as_path(), memory.as_path(), false)
             .unwrap();
         source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
         let saved = MicrovmState::load_from_file(state.as_path()).unwrap();
@@ -1682,6 +1682,7 @@ mod tests {
                 Default::default(),
                 state.as_path(),
                 memory.as_path(),
+                false,
             )
             .unwrap();
         let ram = target.address_space.vm_memory().unwrap();

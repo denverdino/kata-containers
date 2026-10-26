@@ -843,10 +843,14 @@ impl Default for NetworkDeviceMgr {
 #[cfg(test)]
 mod tests {
     use dbs_utils::net::MacAddr;
-    use test_utils::{skip_if_kvm_unaccessable, skip_if_not_root};
+    #[cfg(any(feature = "vhost-net", feature = "vhost-user-net"))]
+    use test_utils::skip_if_kvm_unaccessable;
+    #[cfg(feature = "vhost-net")]
+    use test_utils::skip_if_not_root;
 
     use super::*;
     use crate::device_manager::DeviceManager;
+    #[cfg(any(feature = "vhost-net", feature = "vhost-user-net"))]
     use crate::test_utils::tests::create_vm_for_test;
     use crate::vm::VmConfigInfo;
 
@@ -1109,12 +1113,14 @@ mod tests {
             net_config.guest_mac,
             Some(MacAddr::from_bytes(&[129, 135, 29, 0, 8, 169]).unwrap())
         );
-        if let Backend::Virtio(config) = &net_config.backend {
-            assert_eq!(config.iface_id, "eth0");
-            assert_eq!(config.host_dev_name, "tap0");
-            assert!(config.allow_duplicate_mac);
-        } else {
-            panic!("Unexpected backend type");
+        match &net_config.backend {
+            Backend::Virtio(config) => {
+                assert_eq!(config.iface_id, "eth0");
+                assert_eq!(config.host_dev_name, "tap0");
+                assert!(config.allow_duplicate_mac);
+            }
+            #[cfg(any(feature = "vhost-net", feature = "vhost-user-net"))]
+            _ => panic!("Unexpected backend type"),
         }
         // The virtio backend has always used the default queue count.
         assert_eq!(net_config.num_queues(), DEFAULT_NUM_QUEUES);
