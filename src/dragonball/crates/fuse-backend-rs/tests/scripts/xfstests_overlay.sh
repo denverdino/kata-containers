@@ -48,5 +48,3 @@ echo "====> Start to run xfstests."
 cd /tmp/xfstests-dev
 # Some tests are not supported by fuse or cannot pass currently.
 sudo ./check -fuse -E $current_dir/xfstests_overlay.exclude
-
-

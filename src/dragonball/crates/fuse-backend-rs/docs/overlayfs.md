@@ -1,7 +1,7 @@
 # Architecture of Overlay FS
 
 The implementation of userspace Overlay FS follows [the design of the kernel](https://docs.kernel.org/filesystems/overlayfs.html),
-but it is not a direct port. 
+but it is not a direct port.
 There are some differences between the kernel implementation and the userspace implementation due to FUSE limitations,
 it's under heavy development to make it more stable and more compatible.
 
@@ -26,7 +26,7 @@ Relationship between these structs are illustrated in the following figure:
 Following kernel Overlay semantics, OverlayFs uses the following rules to handle non-directory files:
 
 * If a file with same name exists in all layers, the topmost file will be choosed, any other files with same name in lower layers will be hidden.
-* If a file in lower filesystem is accessed in a way the requires write-access, such as opening for write access, changing some metadata etc., 
+* If a file in lower filesystem is accessed in a way the requires write-access, such as opening for write access, changing some metadata etc.,
 the file is first copied from the lower filesystem to the upper filesystem (copy_up).
 
 ![OverlayFs Non-Directory File](./images/overlayfs_non_dir_file.png)
@@ -44,7 +44,7 @@ Following kernel Overlay semantics, OverlayFs uses the following rules to handle
 ## Whiteout
 
 A whiteout is a special file in OverlayFs, it indicates a deletion of a file or directory in lower layer.
-whiteout is device file with major number 0 and minor number 0, 
+whiteout is device file with major number 0 and minor number 0,
 and the name of whiteout file is the name of file or directory to be deleted.
 
 ## Opaque
@@ -57,4 +57,3 @@ Opaque is implemented by setting one of these xattr to 'y':
 * `user.fuseoverlayfs.opaque`
 
 `user.fuseoverlayfs.opaque` is customized flag for our fuse-overlayfs.
-

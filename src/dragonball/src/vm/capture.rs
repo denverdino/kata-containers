@@ -974,6 +974,122 @@ mod tests {
         paused_counter_vm_with_disk(None)
     }
 
+    #[cfg(feature = "virtio-vsock")]
+    fn configure_vsock(vm: &mut Vm) {
+        use crate::config_manager::DeviceConfigInfo;
+        use crate::device_manager::vsock_dev_mgr::VsockDeviceConfigInfo;
+        vm.device_manager
+            .vsock_manager
+            .info_list
+            .push(DeviceConfigInfo::new(VsockDeviceConfigInfo {
+                id: "agent".into(),
+                guest_cid: 52,
+                use_shared_irq: Some(false),
+                use_generic_irq: Some(false),
+                ..Default::default()
+            }));
+    }
+
+    #[cfg(feature = "virtio-vsock")]
+    #[test]
+    fn held_vsock_restore_preserves_queues_until_reset_and_ack() {
+        use crate::device_manager::{DbsMmioV2Device, DeviceOpContext};
+        use dbs_virtio_devices::persist::VirtioQueueState;
+        let (mut source, _real) = paused_counter_vm();
+        configure_vsock(&mut source);
+        let mut context = DeviceOpContext::new(
+            Some(source.epoll_manager.clone()),
+            &source.device_manager,
+            source.vm_as().cloned(),
+            source.vm_address_space().cloned(),
+            false,
+            Some(source.vm_config.clone()),
+            source.shared_info.clone(),
+        );
+        source
+            .device_manager
+            .vsock_manager
+            .attach_devices(&mut context)
+            .unwrap();
+        let device = source.device_manager.vsock_manager.info_list[0]
+            .device
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mmio = device.as_any().downcast_ref::<DbsMmioV2Device>().unwrap();
+        mmio.state().get_inner_device_mut().set_acked_features(1, 1);
+        let memory = source.address_space.vm_memory().unwrap();
+        let mut transport = mmio.save_state();
+        for (index, queue) in transport.queues.iter_mut().enumerate() {
+            let base = 0x4000 + index as u64 * 0x1000;
+            queue.queue = VirtioQueueState {
+                max_size: 256,
+                size: 16,
+                ready: true,
+                desc_table: base,
+                avail_ring: base + 0x200,
+                used_ring: base + 0x300,
+                ..Default::default()
+            };
+        }
+        // Post the event buffer that the guest driver uses for TRANSPORT_RESET.
+        memory.write_obj(0x8000u64, GuestAddress(0x6000)).unwrap();
+        memory.write_obj(4u32, GuestAddress(0x6008)).unwrap();
+        memory.write_obj(2u16, GuestAddress(0x600c)).unwrap();
+        memory.write_obj(1u16, GuestAddress(0x6202)).unwrap();
+        transport.driver_status = 0xf;
+        transport.device_activated = true;
+        mmio.restore_state(&transport).unwrap();
+        let config = source.vm_config.clone();
+        let state_file = TempFile::new().unwrap();
+        let ram_file = TempFile::new().unwrap();
+        let input = files(&state_file, &ram_file);
+        let capture = source.begin_capture(1, deadline());
+        if capture.is_err() {
+            source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        }
+        let capture = capture.unwrap();
+        assert_eq!(capture.device_acks[0].device_id, "vsock:agent");
+        source.export_held_snapshot(1, deadline(), &input).unwrap();
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        drop(memory);
+        drop(source);
+
+        let epoll = EpollManager::default();
+        let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+            epoll.clone(),
+        )));
+        let mut events = EventManager::new(&vmm, epoll.clone()).unwrap();
+        let mut vmm = vmm.lock().unwrap();
+        let target = vmm.get_vm_mut().unwrap();
+        let real = RealVcpuExecution::new(target.vm_fd.clone());
+        target.set_vm_config(config);
+        configure_vsock(target);
+        target
+            .load_snapshot_held(&mut events, Default::default(), &input, 1, deadline())
+            .unwrap();
+        epoll.handle_events(0).unwrap();
+        let ram = target.address_space.vm_memory().unwrap();
+        assert_eq!(real.run_count(), 0);
+        assert_eq!(ram.read_obj::<u16>(GuestAddress(0x6302)).unwrap(), 0);
+        target.end_capture(1, deadline(), false).unwrap();
+        epoll.handle_events(0).unwrap();
+        assert!(!target
+            .device_manager
+            .vsock_manager
+            .finalize_restore()
+            .unwrap());
+        assert_eq!(ram.read_obj::<u16>(GuestAddress(0x6302)).unwrap(), 1);
+        // Model the guest driver reposting an event buffer after handling reset.
+        ram.write_obj(2u16, GuestAddress(0x6202)).unwrap();
+        assert!(target
+            .device_manager
+            .vsock_manager
+            .finalize_restore()
+            .unwrap());
+        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+    }
+
     #[cfg(feature = "virtio-balloon")]
     fn configure_balloon(vm: &mut Vm) {
         use crate::config_manager::DeviceConfigInfo;

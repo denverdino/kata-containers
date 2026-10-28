@@ -100,8 +100,8 @@ impl FileSystem for Vfs {
                 // which cannot be forwarded to the backend file system.
                 // this situation is reasonable, so it is changed to warn here
                 warn!(
-                    "vfs::forget: failed to get_real_rootfs {:?}, inode: {:?}, 
-                       maybe it is possible that the vfs submount was dropped by umount, 
+                    "vfs::forget: failed to get_real_rootfs {:?}, inode: {:?},
+                       maybe it is possible that the vfs submount was dropped by umount,
                        which is reasonable.",
                     e, inode
                 );

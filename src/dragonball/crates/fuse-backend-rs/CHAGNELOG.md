@@ -182,7 +182,7 @@
 - Fix compile error in vfs async test
 - Record real root inode's ino of file system backends in vfs
 
-### Deprecated 
+### Deprecated
 
 ## [v0.1.2]
 - support KILLPRIV_v2

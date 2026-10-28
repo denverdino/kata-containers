@@ -22,7 +22,7 @@ So the fuse-rs crate is a library to communicate with the Linux FUSE clients, wh
 - API layer, defines the interfaces for Fuse daemons to implement a userspace file system.
 - Transport layer, which supports both the Linux Fuse device and virtio-fs protocol.
 - VFS/pseudo_fs, an abstraction layer to support multiple file systems by a single virtio-fs device.
-- A sample passthrough file system implementation, which passes through files from daemons to clients. 
+- A sample passthrough file system implementation, which passes through files from daemons to clients.
 
 ![arch](docs/images/fuse-backend-architecture.svg)
 
@@ -45,7 +45,7 @@ for an example of implementing a fuse server based on the
 - [Dragonfly Image Service vhost-user-fs Server](https://github.com/dragonflyoss/image-service/blob/master/src/bin/nydusd/virtiofs.rs)
   for an example of implementing vhost-user-fs server based on the
   [fuse-backend-rs](https://crates.io/crates/fuse-backend-rs) crate.
-  
+
 ### Fuse Server and Main Service Loop
 A sample fuse server based on the Linux Fuse device (/dev/fuse):
 
