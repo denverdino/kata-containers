@@ -1209,6 +1209,10 @@ impl AddressSpaceMgr {
     ) -> Result<GuestMemoryState> {
         use std::os::unix::fs::FileExt;
 
+        // Legacy MAP_FIXED restore cannot prove the live backing for alias checks.
+        if !self.memory_file_offsets_valid {
+            return Err(AddressManagerError::InvalidOperation);
+        }
         // This internal read does not acquire or release a caller's read-map pin.
         let map = self.frozen_memory_map(vmfd, generation, false)?;
         let memory = self
@@ -1220,8 +1224,8 @@ impl AddressSpaceMgr {
         let mut buffer = vec![0u8; 1024 * 1024];
         for region in memory.iter() {
             let size = region.len();
-            let mut ranges = match (self.memory_file_offsets_valid, region.file_offset()) {
-                (true, Some(backing)) => {
+            let mut ranges = match region.file_offset() {
+                Some(backing) => {
                     let end = backing
                         .start()
                         .checked_add(size)
@@ -1238,7 +1242,7 @@ impl AddressSpaceMgr {
                         .map_err(AddressManagerError::SnapshotFile)?
                         .unwrap_or_else(|| std::iter::once(0..size).collect())
                 }
-                _ => std::iter::once(0..size).collect(),
+                None => std::iter::once(0..size).collect(),
             };
             if region.flags() & libc::MAP_PRIVATE != 0 {
                 // The ancestor cannot describe private CPU or device writes.
@@ -1249,6 +1253,21 @@ impl AddressSpaceMgr {
                         ranges.push(start - image_offset..end - image_offset);
                     }
                 }
+            } else {
+                // Software marks also cover anonymous balloon replacements.
+                let mut software_ranges = Vec::new();
+                for offset in (0..size).step_by(4096) {
+                    if region.bitmap().dirty_at(offset as usize) {
+                        crate::memory_tracking::push_page(
+                            &mut software_ranges,
+                            image_offset + offset,
+                        );
+                    }
+                }
+                ranges.extend(software_ranges.into_iter().map(|range| {
+                    let start = range.image_offset - image_offset;
+                    start..start + range.length
+                }));
             }
             ranges.sort_unstable_by_key(|range| range.start);
             let mut cursor = 0;
@@ -1468,7 +1487,7 @@ impl<'a> dbs_snapshot::Persist<'a> for AddressSpaceMgr {
         }
 
         // MAP_FIXED leaves the region's FileOffset describing its old mapping.
-        // Held exports must read all current RAM when that metadata is stale.
+        // Held exports must reject this mapping before mutating output files.
         self.memory_file_offsets_valid = false;
         for (region, region_state) in guard.iter().zip(&state.regions) {
             // Back this region with a copy-on-write mapping of the template

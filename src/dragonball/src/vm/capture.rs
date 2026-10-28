@@ -9,6 +9,7 @@ use dbs_snapshot::Persist;
 use dbs_virtio_devices::capture::CaptureGeneration;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::sync::{MutexGuard, TryLockError};
 use std::time::Instant;
@@ -392,6 +393,17 @@ impl Vm {
             {
                 return Err(SnapshotError::InvalidSnapshot(
                     "outputs must be distinct regular files".into(),
+                ));
+            }
+            // Linux pwrite appends on O_APPEND descriptors, ignoring its offset.
+            // SAFETY: the file stays open and F_GETFL takes no additional argument.
+            let flags = unsafe { libc::fcntl(files.memory.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if flags & libc::O_APPEND != 0 {
+                return Err(SnapshotError::InvalidSnapshot(
+                    "memory output must not use append mode".into(),
                 ));
             }
             for output in [&files.state, &files.memory] {
@@ -1405,7 +1417,99 @@ mod tests {
     }
 
     #[test]
-    fn held_snapshot_after_legacy_restore_reads_current_mapping() {
+    #[cfg(feature = "virtio-balloon")]
+    fn held_snapshot_preserves_cold_reclaimed_pages() {
+        use crate::address_space_manager::PrivateMemoryReclaimer;
+        let (mut vm, real) = paused_counter_vm();
+        let ram = vm.address_space.vm_memory().unwrap();
+        let region = ram.iter().next().unwrap();
+        assert_ne!(region.flags() & libc::MAP_SHARED, 0);
+        let backing = region.file_offset().unwrap().file();
+        // Force real holes even on tmpfs hosts which allocate larger folios.
+        // SAFETY: these complete pages are unused by the paused test guest.
+        assert_eq!(
+            unsafe {
+                libc::fallocate(
+                    backing.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    0x6000,
+                    8192,
+                )
+            },
+            0
+        );
+        let reclaimer = PrivateMemoryReclaimer::new(vm.vm_as().cloned().unwrap());
+        reclaimer.reclaim_private_range(0x6000, 8192).unwrap();
+        // The real CPU writes the first anonymous page through the original slot.
+        ram.write_slice(&[0xff, 0x06, 0x00, 0x60, 0xeb, 0xfa], GuestAddress(0x1000))
+            .unwrap();
+        vm.begin_capture(1, deadline()).unwrap();
+        vm.end_capture(1, deadline(), true).unwrap();
+        let limit = deadline();
+        while ram.read_obj::<u16>(GuestAddress(0x6000)).unwrap() == 0 && Instant::now() < limit {
+            std::thread::yield_now();
+        }
+        vm.begin_capture(2, deadline()).unwrap();
+        let counter = ram.read_obj::<u16>(GuestAddress(0x6000)).unwrap();
+        ram.write_obj(0x93u8, GuestAddress(0x7000)).unwrap();
+        let before = backing.metadata().unwrap().blocks();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        let result = vm.export_held_snapshot(2, deadline(), &files(&state, &memory));
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        result.unwrap();
+        assert!(real.run_count() > 0);
+        assert_ne!(counter, 0);
+        let mut saved = [0; 2];
+        memory.as_file().read_exact_at(&mut saved, 0x6000).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(saved),
+            counter,
+            "CPU writes to cold reclaimed RAM must survive"
+        );
+        memory
+            .as_file()
+            .read_exact_at(&mut saved[..1], 0x7000)
+            .unwrap();
+        assert_eq!(
+            saved[0], 0x93,
+            "software writes to cold reclaimed RAM must survive"
+        );
+        assert_eq!(backing.metadata().unwrap().blocks(), before);
+        assert_eq!(memory.as_file().metadata().unwrap().len(), 16 << 20);
+        assert!(memory.as_file().metadata().unwrap().blocks() * 512 < 1 << 20);
+    }
+
+    #[test]
+    fn held_snapshot_rejects_append_memory_output() {
+        let (mut vm, _real) = paused_counter_vm();
+        vm.begin_capture(1, deadline()).unwrap();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        state.as_file().write_all_at(b"state sentinel", 0).unwrap();
+        memory
+            .as_file()
+            .write_all_at(b"memory sentinel", 0)
+            .unwrap();
+        let mut output = files(&state, &memory);
+        output.memory = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(memory.as_path())
+                .unwrap(),
+        );
+        let result = vm.export_held_snapshot(1, deadline(), &output);
+        let held = vm.end_capture(1, deadline(), false);
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        assert!(result.is_err(), "append mode cannot honor packed offsets");
+        held.unwrap();
+        assert_eq!(std::fs::read(state.as_path()).unwrap(), b"state sentinel");
+        assert_eq!(std::fs::read(memory.as_path()).unwrap(), b"memory sentinel");
+    }
+
+    #[test]
+    fn held_snapshot_rejects_legacy_restore_without_mutating_outputs() {
         let (mut source, _real) = paused_counter_vm();
         source
             .address_space
@@ -1444,20 +1548,36 @@ mod tests {
         target.begin_capture(1, deadline()).unwrap();
         let output_state = TempFile::new().unwrap();
         let output_memory = TempFile::new().unwrap();
-        let result =
-            target.export_held_snapshot(1, deadline(), &files(&output_state, &output_memory));
-        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
-        result.unwrap();
-        let mut saved = [0];
+        output_state
+            .as_file()
+            .write_all_at(b"state sentinel", 0)
+            .unwrap();
         output_memory
             .as_file()
-            .read_exact_at(&mut saved, 8 << 20)
+            .write_all_at(b"memory sentinel", 0)
             .unwrap();
-        assert_eq!(
-            saved,
-            [0x73],
-            "legacy remapping must not trust the original memfd extents"
-        );
+        let ancestor = std::fs::read(memory.as_path()).unwrap();
+        for output in [
+            files(&output_state, &output_memory),
+            files(&memory, &output_memory),
+            files(&output_state, &memory),
+        ] {
+            if target.export_held_snapshot(1, deadline(), &output).is_ok() {
+                target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+                panic!("legacy mapping has no current backing proof");
+            }
+            assert_eq!(std::fs::read(memory.as_path()).unwrap(), ancestor);
+            assert_eq!(
+                std::fs::read(output_state.as_path()).unwrap(),
+                b"state sentinel"
+            );
+            assert_eq!(
+                std::fs::read(output_memory.as_path()).unwrap(),
+                b"memory sentinel"
+            );
+        }
+        target.end_capture(1, deadline(), false).unwrap();
+        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
     }
 
     #[test]
