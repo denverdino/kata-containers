@@ -103,6 +103,8 @@ pub struct Config {
     /// Retained file references must identify the same host object after restore.
     /// Files in these scopes have zero entry and attribute cache timeouts so a
     /// fresh guest open looks up the current host object. Data caching is unchanged.
+    /// Same-mount hardlinks across scope boundaries are unsupported. Mount these
+    /// subtrees separately so aliases outside a scope have distinct mount identities.
     pub preserve_file_identity: Vec<std::path::PathBuf>,
 
     /// Whether the file system should support Extended Attributes (xattr). Enabling this feature may
