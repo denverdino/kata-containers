@@ -554,6 +554,22 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         Self::readlinkat(self.proc_self_fd.as_raw_fd(), &pathname)
     }
 
+    // Live files can be replaced while the guest is stopped. A cached dentry
+    // would send a fresh OPEN to the retained old inode without a new LOOKUP.
+    fn uncached_metadata(&self, inode: Inode, mode: u32) -> io::Result<bool> {
+        if is_dir(mode) || self.cfg.preserve_file_identity.is_empty() {
+            return Ok(false);
+        }
+        let path = self.readlinkat_proc_file(inode)?;
+        let root = self.readlinkat_proc_file(fuse::ROOT_ID)?;
+        Ok(path.strip_prefix(root).is_ok_and(|relative| {
+            self.cfg
+                .preserve_file_identity
+                .iter()
+                .any(|scope| relative.starts_with(scope))
+        }))
+    }
+
     fn create_file_excl(
         dir: &impl AsRawFd,
         pathname: &CStr,
@@ -736,7 +752,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             }
         };
 
-        let (entry_timeout, attr_timeout) = if is_dir(st.st.st_mode) {
+        let (entry_timeout, attr_timeout) = if self.uncached_metadata(inode, st.st.st_mode)? {
+            (Duration::ZERO, Duration::ZERO)
+        } else if is_dir(st.st.st_mode) {
             (self.dir_entry_timeout, self.dir_attr_timeout)
         } else {
             (self.cfg.entry_timeout, self.cfg.attr_timeout)
@@ -1331,6 +1349,94 @@ mod tests {
         assert_eq!(c_entry.attr_timeout, Duration::from_secs(0));
 
         fs.destroy();
+    }
+
+    #[test]
+    fn test_preserved_file_metadata_timeout() {
+        let source = TempDir::new().unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: source.as_path().to_str().unwrap().to_owned(),
+            preserve_file_identity: vec!["csi".into(), "system-info".into()],
+            cache_policy: CachePolicy::Auto,
+            entry_timeout: Duration::from_secs(5),
+            attr_timeout: Duration::from_secs(7),
+            dir_entry_timeout: Some(Duration::from_secs(3)),
+            dir_attr_timeout: Some(Duration::from_secs(4)),
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let ctx = Context::default();
+        for (directory, live) in [
+            ("csi", true),
+            ("system-info", true),
+            ("csi-neighbor", false),
+            ("system-info-neighbor", false),
+            ("rootfs", false),
+        ] {
+            std::fs::create_dir(source.as_path().join(directory)).unwrap();
+            let parent = fs
+                .lookup(&ctx, ROOT_ID, &CString::new(directory).unwrap())
+                .unwrap();
+            assert_eq!(parent.entry_timeout, Duration::from_secs(3));
+            assert_eq!(parent.attr_timeout, Duration::from_secs(4));
+            let name = CString::new("file").unwrap();
+            let (created, handle, options, _) = fs
+                .create(
+                    &ctx,
+                    parent.inode,
+                    &name,
+                    CreateIn {
+                        flags: libc::O_RDWR as u32,
+                        mode: 0o644,
+                        umask: 0,
+                        fuse_flags: 0,
+                    },
+                )
+                .unwrap();
+            let expected_entry = Duration::from_secs(if live { 0 } else { 5 });
+            let expected_attr = Duration::from_secs(if live { 0 } else { 7 });
+            assert_eq!(created.entry_timeout, expected_entry, "create {directory}");
+            assert_eq!(created.attr_timeout, expected_attr, "create {directory}");
+            assert!(!options.contains(OpenOptions::DIRECT_IO));
+            for handle in [None, handle] {
+                assert_eq!(
+                    fs.getattr(&ctx, created.inode, handle).unwrap().1,
+                    expected_attr,
+                    "getattr {directory}"
+                );
+            }
+            let looked_up = fs.lookup(&ctx, parent.inode, &name).unwrap();
+            assert_eq!(
+                looked_up.entry_timeout, expected_entry,
+                "lookup {directory}"
+            );
+            assert_eq!(looked_up.attr_timeout, expected_attr, "lookup {directory}");
+            let (dir_handle, _) = fs
+                .opendir(&ctx, parent.inode, libc::O_RDONLY as u32)
+                .unwrap();
+            let mut seen = false;
+            fs.readdirplus(
+                &ctx,
+                parent.inode,
+                dir_handle.unwrap(),
+                4096,
+                0,
+                &mut |item, entry| {
+                    if item.name == b"file" {
+                        seen = true;
+                        assert_eq!(
+                            entry.entry_timeout, expected_entry,
+                            "readdirplus {directory}"
+                        );
+                        assert_eq!(entry.attr_timeout, expected_attr, "readdirplus {directory}");
+                    }
+                    Ok(1)
+                },
+            )
+            .unwrap();
+            assert!(seen, "readdirplus omitted {directory}/file");
+        }
     }
 
     #[test]

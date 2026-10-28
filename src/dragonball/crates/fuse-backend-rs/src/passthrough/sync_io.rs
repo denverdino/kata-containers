@@ -250,7 +250,12 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             e
         })?;
 
-        Ok((st, self.cfg.attr_timeout))
+        let timeout = if self.uncached_metadata(inode, st.st_mode)? {
+            Duration::ZERO
+        } else {
+            self.cfg.attr_timeout
+        };
+        Ok((st, timeout))
     }
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {

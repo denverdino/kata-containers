@@ -101,6 +101,8 @@ pub struct Config {
 
     /// Share-relative subtrees whose files are not reconstructed from the snapshot.
     /// Retained file references must identify the same host object after restore.
+    /// Files in these scopes have zero entry and attribute cache timeouts so a
+    /// fresh guest open looks up the current host object. Data caching is unchanged.
     pub preserve_file_identity: Vec<std::path::PathBuf>,
 
     /// Whether the file system should support Extended Attributes (xattr). Enabling this feature may
