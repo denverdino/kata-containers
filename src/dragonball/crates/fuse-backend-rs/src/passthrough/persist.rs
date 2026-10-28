@@ -72,6 +72,7 @@ impl FileIdentity {
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // The successful statx call initialized the buffer.
             let birth = unsafe { birth.assume_init() };
             if birth.stx_mask & libc::STATX_BTIME == 0 {
                 return Err(io::Error::new(
@@ -181,6 +182,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let mut scopes = BTreeSet::new();
         for scope in &self.cfg.preserve_file_identity {
             if scope.as_os_str().is_empty()
+                || scope.as_os_str().as_bytes().contains(&0)
                 || !scope
                     .components()
                     .all(|part| matches!(part, Component::Normal(_)))
@@ -622,6 +624,7 @@ mod tests {
             "live/",
             "live//child",
             "./live",
+            "live\0name",
         ] {
             let fs = scoped_filesystem(root.as_path(), vec![PathBuf::from(scope)]);
             assert!(fs.save_state().is_err(), "{scope}");

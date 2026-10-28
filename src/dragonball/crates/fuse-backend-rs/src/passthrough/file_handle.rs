@@ -175,6 +175,8 @@ extern "C" {
 }
 
 impl FileHandle {
+    // Mount IDs change when the same filesystem is bound again.
+    #[cfg(feature = "persist")]
     pub(crate) fn identity(&self) -> (i32, Vec<u8>) {
         let handle = self.handle.wrapper.as_fam_struct_ref();
         // The wrapper owns exactly handle_bytes initialized bytes.
