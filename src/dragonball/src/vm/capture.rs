@@ -398,8 +398,11 @@ impl Vm {
                 self.validate_state_output(output)?;
             }
             let mut state = self.held_snapshot_metadata(&expected, deadline)?;
-            let mut memory = files.memory.try_clone()?;
-            state.memory_state = Some(self.address_space.save_state(&mut memory)?);
+            state.memory_state = Some(self.address_space.save_held_memory(
+                &self.vm_fd,
+                generation,
+                &files.memory,
+            )?);
             let mut output = files.state.try_clone()?;
             output.seek(SeekFrom::Start(0))?;
             output.set_len(0)?;
@@ -906,6 +909,7 @@ mod tests {
     use crate::snapshot::capture::SnapshotFiles;
     use crate::vcpu::RealVcpuExecution;
     use dbs_snapshot::Persist;
+    use std::convert::TryInto;
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt;
     use std::time::{Duration, Instant};
@@ -1325,6 +1329,260 @@ mod tests {
     }
 
     #[test]
+    fn held_snapshot_preserves_cold_memory_sparsity() {
+        let (mut vm, real) = paused_counter_vm();
+        let ram = vm.address_space.vm_memory().unwrap();
+        vm.begin_capture(1, deadline()).unwrap();
+        vm.end_capture(1, deadline(), true).unwrap();
+        let limit = deadline();
+        while ram.read_obj::<u16>(GuestAddress(0x2000)).unwrap() == 0 && Instant::now() < limit {
+            std::thread::yield_now();
+        }
+        vm.begin_capture(2, deadline()).unwrap();
+        let counter = ram.read_obj::<u16>(GuestAddress(0x2000)).unwrap();
+        let source_blocks: u64 = ram
+            .iter()
+            .map(|region| {
+                region
+                    .file_offset()
+                    .unwrap()
+                    .file()
+                    .metadata()
+                    .unwrap()
+                    .blocks()
+            })
+            .sum();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        // Reused outputs must lose old bytes, including a trailing allocated page.
+        memory
+            .as_file()
+            .write_all_at(&[0xa5; 4096], (16 << 20) - 4096)
+            .unwrap();
+        let result = vm.export_held_snapshot(2, deadline(), &files(&state, &memory));
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        result.unwrap();
+        assert!(real.run_count() > 0);
+        assert_ne!(counter, 0);
+        let output = memory.as_file().metadata().unwrap();
+        assert_eq!(output.len(), 16 << 20);
+        eprintln!(
+            "cold RAM: logical={} allocated={} source_before={}",
+            output.len(),
+            output.blocks() * 512,
+            source_blocks * 512
+        );
+        assert!(
+            output.blocks() * 512 < output.len() / 2,
+            "snapshot must preserve RAM holes"
+        );
+        let after_blocks: u64 = ram
+            .iter()
+            .map(|region| {
+                region
+                    .file_offset()
+                    .unwrap()
+                    .file()
+                    .metadata()
+                    .unwrap()
+                    .blocks()
+            })
+            .sum();
+        eprintln!("cold RAM: source_after={}", after_blocks * 512);
+        assert_eq!(
+            after_blocks, source_blocks,
+            "export must not allocate untouched shmem pages"
+        );
+        let mut saved = [0; 2];
+        memory.as_file().read_exact_at(&mut saved, 0x2000).unwrap();
+        assert_eq!(u16::from_le_bytes(saved), counter);
+        let mut tail = [1; 4096];
+        memory
+            .as_file()
+            .read_exact_at(&mut tail, (16 << 20) - 4096)
+            .unwrap();
+        assert_eq!(tail, [0; 4096]);
+    }
+
+    #[test]
+    fn held_snapshot_after_legacy_restore_reads_current_mapping() {
+        let (mut source, _real) = paused_counter_vm();
+        source
+            .address_space
+            .vm_memory()
+            .unwrap()
+            .write_obj(0x73u8, GuestAddress(8 << 20))
+            .unwrap();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        source.begin_capture(1, deadline()).unwrap();
+        source
+            .export_held_snapshot(1, deadline(), &files(&state, &memory))
+            .unwrap();
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        let config = source.vm_config.clone();
+        drop(source);
+        let mut target = super::super::tests::create_vm_instance();
+        target.set_vm_config(config);
+        target.init_guest_memory().unwrap();
+        let vm_as = target.vm_as().cloned().unwrap();
+        target
+            .init_vcpu_manager(vm_as.clone(), Default::default())
+            .unwrap();
+        target
+            .init_microvm_from_snapshot(target.epoll_manager.clone(), vm_as, TimestampUs::default())
+            .unwrap();
+        target
+            .restore_microvm(state.as_path(), memory.as_path(), false)
+            .unwrap();
+        target
+            .vcpu_manager()
+            .unwrap()
+            .start_vcpus(1, Default::default(), false)
+            .unwrap();
+        target.set_instance_state(InstanceState::Paused);
+        target.begin_capture(1, deadline()).unwrap();
+        let output_state = TempFile::new().unwrap();
+        let output_memory = TempFile::new().unwrap();
+        let result =
+            target.export_held_snapshot(1, deadline(), &files(&output_state, &output_memory));
+        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        result.unwrap();
+        let mut saved = [0];
+        output_memory
+            .as_file()
+            .read_exact_at(&mut saved, 8 << 20)
+            .unwrap();
+        assert_eq!(
+            saved,
+            [0x73],
+            "legacy remapping must not trust the original memfd extents"
+        );
+    }
+
+    #[test]
+    fn held_snapshot_preserves_sparse_cow_across_restores() {
+        let (mut source, _real) = paused_counter_vm();
+        let ram = source.address_space.vm_memory().unwrap();
+        ram.write_slice(&[0x51; 4096], GuestAddress(0x5000))
+            .unwrap();
+        ram.write_slice(&[0x72; 4096], GuestAddress(8 << 20))
+            .unwrap();
+        let config = source.vm_config.clone();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        let mut input = files(&state, &memory);
+        source.begin_capture(1, deadline()).unwrap();
+        source.export_held_snapshot(1, deadline(), &input).unwrap();
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        drop(ram);
+        drop(source);
+        let mut expected = vec![0; 16 << 20];
+        input.memory.read_exact_at(&mut expected, 0).unwrap();
+        for cycle in 1..=3 {
+            let ancestor = expected.clone();
+            let epoll = EpollManager::default();
+            let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+                epoll.clone(),
+            )));
+            let mut events = EventManager::new(&vmm, epoll).unwrap();
+            let mut guard = vmm.lock().unwrap();
+            let target = guard.get_vm_mut().unwrap();
+            let real = RealVcpuExecution::new(target.vm_fd.clone());
+            target.set_vm_config(config.clone());
+            target
+                .load_snapshot_held(&mut events, Default::default(), &input, 1, deadline())
+                .unwrap();
+            let ram = target.address_space.vm_memory().unwrap();
+            // No read of the unchanged nonzero page at 8 MiB before export.
+            let host = ram.get_host_address(GuestAddress(8 << 20)).unwrap() as u64;
+            let mut pte = [0; 8];
+            File::open("/proc/self/pagemap")
+                .unwrap()
+                .read_exact_at(&mut pte, host / 4096 * 8)
+                .unwrap();
+            assert_eq!(
+                u64::from_le_bytes(pte) & (1 << 63),
+                0,
+                "base page must be nonresident in the new mapping"
+            );
+            let previous = u16::from_le_bytes(expected[0x2000..0x2002].try_into().unwrap());
+            target.end_capture(1, deadline(), true).unwrap();
+            let limit = deadline();
+            while ram.read_obj::<u16>(GuestAddress(0x2000)).unwrap() == previous
+                && Instant::now() < limit
+            {
+                std::thread::yield_now();
+            }
+            target.begin_capture(2, deadline()).unwrap();
+            let counter = ram.read_obj::<u16>(GuestAddress(0x2000)).unwrap();
+            assert_ne!(counter, previous);
+            assert!(real.run_count() > 0);
+            // Software/DMA writes include both an ancestor page cleared to zero
+            // and a private nonzero page whose ancestor is a hole.
+            ram.write_slice(&[0; 4096], GuestAddress(0x5000)).unwrap();
+            ram.write_slice(&[cycle; 4096], GuestAddress(6 << 20))
+                .unwrap();
+            expected[0x2000..0x2002].copy_from_slice(&counter.to_le_bytes());
+            expected[0x5000..0x6000].fill(0);
+            expected[6 << 20..(6 << 20) + 4096].fill(cycle);
+            let output_state = TempFile::new().unwrap();
+            let output_memory = TempFile::new().unwrap();
+            let mut readonly = files(&output_state, &output_memory);
+            readonly.memory = Arc::new(File::open(output_memory.as_path()).unwrap());
+            assert!(target
+                .export_held_snapshot(2, deadline(), &readonly)
+                .is_err());
+            target.end_capture(2, deadline(), false).unwrap();
+            target.begin_capture(3, deadline()).unwrap();
+            target
+                .export_held_memory_map_without_zero_scan(3, deadline())
+                .unwrap();
+            let output = files(&output_state, &output_memory);
+            let result = target.export_held_snapshot(3, deadline(), &output);
+            let pinned = target.end_capture(3, deadline(), false).is_err();
+            target.release_held_memory_map(3).unwrap();
+            target.end_capture(3, deadline(), false).unwrap();
+            target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+            result.unwrap();
+            assert!(pinned, "full export must retain the caller's read pin");
+            let mut actual = vec![0; expected.len()];
+            output.memory.read_exact_at(&mut actual, 0).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .position(|(actual, expected)| actual != expected),
+                None,
+                "first differing byte after cycle {cycle}"
+            );
+            input.memory.read_exact_at(&mut actual, 0).unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .zip(&ancestor)
+                    .position(|(actual, expected)| actual != expected),
+                None,
+                "private writes must not change the ancestor"
+            );
+            assert_eq!(
+                output.memory.metadata().unwrap().len(),
+                expected.len() as u64
+            );
+            eprintln!(
+                "COW cycle {cycle}: logical={} allocated={}",
+                output.memory.metadata().unwrap().len(),
+                output.memory.metadata().unwrap().blocks() * 512
+            );
+            assert!(
+                output.memory.metadata().unwrap().blocks() * 512 < 1 << 20,
+                "restored snapshot must retain holes"
+            );
+            input = output;
+        }
+    }
+
+    #[test]
     fn m2_cold_export_covers_complete_layout() {
         let (mut vm, _real) = paused_counter_vm();
         let report = vm.begin_capture(1, deadline()).unwrap();
@@ -1707,19 +1965,20 @@ mod tests {
     }
 
     fn paused_counter_vm_with_disk(disk: Option<&std::path::Path>) -> (Vm, RealVcpuExecution) {
-        paused_counter_vm_with_disk_slot(disk, false)
+        paused_counter_vm_with_disk_slot(disk, false, 16)
     }
 
     fn paused_counter_vm_with_disk_slot(
         disk: Option<&std::path::Path>,
         slot: bool,
+        mem_size_mib: usize,
     ) -> (Vm, RealVcpuExecution) {
         let mut vm = super::super::tests::create_vm_instance();
         let real = RealVcpuExecution::new(vm.vm_fd.clone());
         let config = VmConfigInfo {
             vcpu_count: 1,
             max_vcpu_count: 1,
-            mem_size_mib: 16,
+            mem_size_mib,
             mem_type: "shmem".to_owned(),
             cpu_pm: "off".to_owned(),
             ..Default::default()
@@ -2000,13 +2259,7 @@ mod tests {
 
     #[test]
     fn capture_full_layout_handles_gpa_hole() {
-        let mut vm = super::super::tests::create_vm_instance();
-        vm.set_vm_config(VmConfigInfo {
-            mem_size_mib: 8192,
-            mem_type: "shmem".into(),
-            ..Default::default()
-        });
-        vm.init_guest_memory().unwrap();
+        let (mut vm, _real) = paused_counter_vm_with_disk_slot(None, false, 8192);
         let layout = vm.address_space.capture_layout().unwrap();
         assert!(layout.regions.len() > 1);
         assert_eq!(layout.total_bytes, 8 * 1024 * 1024 * 1024);
@@ -2029,6 +2282,89 @@ mod tests {
             .regions
             .windows(2)
             .any(|pair| pair[0].guest_addr + pair[0].size < pair[1].guest_addr));
+        let ram = vm.address_space.vm_memory().unwrap();
+        for (index, region) in layout.regions.iter().enumerate() {
+            ram.write_obj(
+                0x71u8 + index as u8,
+                GuestAddress(region.guest_addr + 0x3000),
+            )
+            .unwrap();
+        }
+        let config = vm.vm_config.clone();
+        let state = TempFile::new().unwrap();
+        let memory = TempFile::new().unwrap();
+        let input = files(&state, &memory);
+        vm.begin_capture(1, deadline()).unwrap();
+        let result = vm.export_held_snapshot(1, deadline(), &input);
+        vm.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        result.unwrap();
+        drop(ram);
+        drop(vm);
+        assert_eq!(input.memory.metadata().unwrap().len(), layout.total_bytes);
+        assert!(input.memory.metadata().unwrap().blocks() * 512 < 1 << 20);
+        for (index, region) in layout.regions.iter().enumerate() {
+            let mut marker = [0];
+            input
+                .memory
+                .read_exact_at(&mut marker, region.file_offset + 0x3000)
+                .unwrap();
+            assert_eq!(marker, [0x71 + index as u8]);
+            let mut tail = [1; 4096];
+            input
+                .memory
+                .read_exact_at(&mut tail, region.file_offset + region.size - 4096)
+                .unwrap();
+            assert_eq!(tail, [0; 4096]);
+        }
+        let epoll = EpollManager::default();
+        let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+            epoll.clone(),
+        )));
+        let mut events = EventManager::new(&vmm, epoll).unwrap();
+        let mut guard = vmm.lock().unwrap();
+        let target = guard.get_vm_mut().unwrap();
+        let _real = RealVcpuExecution::new(target.vm_fd.clone());
+        target.set_vm_config(config);
+        target
+            .load_snapshot_held(&mut events, Default::default(), &input, 1, deadline())
+            .unwrap();
+        let high = layout.regions.last().unwrap();
+        let ram = target.address_space.vm_memory().unwrap();
+        ram.write_obj(0u8, GuestAddress(high.guest_addr + 0x3000))
+            .unwrap();
+        ram.write_obj(0x93u8, GuestAddress(high.guest_addr + 0x4000))
+            .unwrap();
+        let output_state = TempFile::new().unwrap();
+        let output_memory = TempFile::new().unwrap();
+        let output = files(&output_state, &output_memory);
+        let result = target.export_held_snapshot(1, deadline(), &output);
+        target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        result.unwrap();
+        assert_eq!(output.memory.metadata().unwrap().len(), layout.total_bytes);
+        assert!(output.memory.metadata().unwrap().blocks() * 512 < 1 << 20);
+        for (index, region) in layout.regions.iter().enumerate() {
+            let mut page = [0; 4096];
+            output
+                .memory
+                .read_exact_at(&mut page, region.file_offset + 0x3000)
+                .unwrap();
+            let mut expected = [0; 4096];
+            if index + 1 != layout.regions.len() {
+                expected[0] = 0x71 + index as u8;
+            }
+            assert_eq!(page, expected);
+            output
+                .memory
+                .read_exact_at(&mut page, region.file_offset + region.size - 4096)
+                .unwrap();
+            assert_eq!(page, [0; 4096]);
+        }
+        let mut marker = [0];
+        output
+            .memory
+            .read_exact_at(&mut marker, high.file_offset + 0x4000)
+            .unwrap();
+        assert_eq!(marker, [0x93]);
     }
 
     #[test]
@@ -2232,7 +2568,7 @@ mod tests {
     fn m2_slot_rejects_template_contract_changes_before_allocation() {
         let disk = TempFile::new().unwrap();
         disk.as_file().set_len(4096).unwrap();
-        let (mut source, _real) = paused_counter_vm_with_disk_slot(Some(disk.as_path()), true);
+        let (mut source, _real) = paused_counter_vm_with_disk_slot(Some(disk.as_path()), true, 16);
         let state = TempFile::new().unwrap();
         let memory = TempFile::new().unwrap();
         let snapshot = files(&state, &memory);
@@ -2280,7 +2616,7 @@ mod tests {
                 .write_all_at(&[0x3c; 512], capacity - 512)
                 .unwrap();
             let (mut source, _source_real) =
-                paused_counter_vm_with_disk_slot(Some(placeholder.as_path()), true);
+                paused_counter_vm_with_disk_slot(Some(placeholder.as_path()), true, 16);
             let config = source.vm_config.clone();
             source.begin_capture(1, deadline()).unwrap();
             let ram = source.address_space.vm_memory().unwrap();

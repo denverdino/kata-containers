@@ -373,6 +373,68 @@ pub fn inspect_memory_backing(file: &File) -> Result<MemoryBackingInfo> {
     })
 }
 
+// Return page-aligned offsets relative to the mapping, without reading its holes.
+#[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+fn backing_data_ranges(
+    file: &File,
+    start: u64,
+    end: u64,
+) -> std::io::Result<Option<Vec<std::ops::Range<u64>>>> {
+    if end > i64::MAX as u64 || !start.is_multiple_of(4096) || !end.is_multiple_of(4096) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let seek = |offset: u64, kind| {
+        // SAFETY: the descriptor is borrowed and the checked offset fits off_t.
+        let result = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, kind) };
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(result as u64)
+        }
+    };
+    let mut ranges = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let data = match seek(cursor, libc::SEEK_DATA) {
+            Ok(data) => data,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => break,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        if data < cursor {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        if data >= end {
+            break;
+        }
+        let hole = match seek(data, libc::SEEK_HOLE) {
+            Ok(hole) => hole,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        if hole <= data {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        ranges.push((data - start) / 4096 * 4096..(hole.min(end) - start).div_ceil(4096) * 4096);
+        cursor = hole;
+    }
+    Ok(Some(ranges))
+}
+
 /// Parameters to configure address space creation operations.
 pub struct AddressSpaceMgrBuilder<'a> {
     mem_type: &'a str,
@@ -486,6 +548,7 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
 pub struct AddressSpaceMgr {
     memory_tracker: crate::memory_tracking::MemoryTracker,
     dirty_logging: bool,
+    memory_file_offsets_valid: bool,
     address_space: Option<AddressSpace>,
     vm_as: Option<GuestAddressSpaceImpl>,
     base_to_slot: Arc<Mutex<HashMap<u64, u32>>>,
@@ -1136,6 +1199,105 @@ impl AddressSpaceMgr {
         Ok(map)
     }
 
+    /// Save held RAM using backing extents and private dirty pages.
+    #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
+    pub(crate) fn save_held_memory(
+        &mut self,
+        vmfd: &VmFd,
+        generation: u64,
+        file: &File,
+    ) -> Result<GuestMemoryState> {
+        use std::os::unix::fs::FileExt;
+
+        // This internal read does not acquire or release a caller's read-map pin.
+        let map = self.frozen_memory_map(vmfd, generation, false)?;
+        let memory = self
+            .vm_memory()
+            .ok_or(AddressManagerError::GuestMemoryNotInitialized)?;
+        file.set_len(0).map_err(AddressManagerError::SnapshotFile)?;
+        let mut regions = Vec::new();
+        let mut image_offset = 0;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        for region in memory.iter() {
+            let size = region.len();
+            let mut ranges = match (self.memory_file_offsets_valid, region.file_offset()) {
+                (true, Some(backing)) => {
+                    let end = backing
+                        .start()
+                        .checked_add(size)
+                        .ok_or(AddressManagerError::InvalidOperation)?;
+                    let capacity = inspect_memory_backing(backing.file())?.capacity;
+                    if end > capacity {
+                        return Err(AddressManagerError::SnapshotFileTooSmall {
+                            guest_addr: region.start_addr().raw_value(),
+                            needed: end,
+                            file_len: capacity,
+                        });
+                    }
+                    backing_data_ranges(backing.file(), backing.start(), end)
+                        .map_err(AddressManagerError::SnapshotFile)?
+                        .unwrap_or_else(|| std::iter::once(0..size).collect())
+                }
+                _ => std::iter::once(0..size).collect(),
+            };
+            if region.flags() & libc::MAP_PRIVATE != 0 {
+                // The ancestor cannot describe private CPU or device writes.
+                for changed in &map.changed_ranges {
+                    let start = changed.image_offset.max(image_offset);
+                    let end = (changed.image_offset + changed.length).min(image_offset + size);
+                    if start < end {
+                        ranges.push(start - image_offset..end - image_offset);
+                    }
+                }
+            }
+            ranges.sort_unstable_by_key(|range| range.start);
+            let mut cursor = 0;
+            for range in ranges {
+                let mut start = range.start.max(cursor);
+                while start < range.end {
+                    let length = (range.end - start).min(buffer.len() as u64) as usize;
+                    let bytes = &mut buffer[..length];
+                    region
+                        .read_slice(bytes, MemoryRegionAddress(start))
+                        .map_err(|error| {
+                            AddressManagerError::AccessGuestMemory(
+                                region.start_addr().raw_value() + start,
+                                error,
+                            )
+                        })?;
+                    // Coalesce nonzero pages into writes, leaving zero pages as holes.
+                    let mut run = None;
+                    for (index, page) in bytes.chunks(4096).enumerate() {
+                        if page.iter().any(|byte| *byte != 0) {
+                            run.get_or_insert(index * 4096);
+                        } else if let Some(first) = run.take() {
+                            file.write_all_at(
+                                &bytes[first..index * 4096],
+                                image_offset + start + first as u64,
+                            )
+                            .map_err(AddressManagerError::SnapshotFile)?;
+                        }
+                    }
+                    if let Some(first) = run {
+                        file.write_all_at(&bytes[first..], image_offset + start + first as u64)
+                            .map_err(AddressManagerError::SnapshotFile)?;
+                    }
+                    start += length as u64;
+                }
+                cursor = cursor.max(range.end);
+            }
+            regions.push(GuestMemoryRegionState {
+                guest_addr: region.start_addr().raw_value(),
+                size,
+                file_offset: image_offset,
+            });
+            image_offset += size;
+        }
+        file.set_len(image_offset)
+            .map_err(AddressManagerError::SnapshotFile)?;
+        Ok(GuestMemoryState { regions })
+    }
+
     /// Get NUMA node information from the address space manager.
     pub fn get_numa_nodes(&self) -> &BTreeMap<u32, NumaNode> {
         &self.numa_nodes
@@ -1305,6 +1467,9 @@ impl<'a> dbs_snapshot::Persist<'a> for AddressSpaceMgr {
             }
         }
 
+        // MAP_FIXED leaves the region's FileOffset describing its old mapping.
+        // Held exports must read all current RAM when that metadata is stale.
+        self.memory_file_offsets_valid = false;
         for (region, region_state) in guard.iter().zip(&state.regions) {
             // Back this region with a copy-on-write mapping of the template
             // file instead of copying it in: pages fault in lazily from the
@@ -1348,6 +1513,7 @@ impl Default for AddressSpaceMgr {
         AddressSpaceMgr {
             memory_tracker: Default::default(),
             dirty_logging: false,
+            memory_file_offsets_valid: true,
             address_space: None,
             vm_as: None,
             base_to_slot: Arc::new(Mutex::new(HashMap::new())),
