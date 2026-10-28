@@ -18,6 +18,7 @@ use vm_memory::{GuestAddress, GuestMemoryError};
 
 pub use self::defs::{NUM_QUEUES, QUEUE_SIZES};
 pub use self::device::{Vsock, VsockState};
+pub use self::epoll_handler::VsockCaptureControl;
 use self::muxer::Error as MuxerError;
 pub use self::muxer::VsockMuxer;
 use self::packet::VsockPacket;

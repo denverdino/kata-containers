@@ -9,7 +9,8 @@
 
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex, TryLockError};
+use std::time::Instant;
 
 use dbs_utils::epoll_manager::{EventOps, EventSet, Events, MutEventSubscriber};
 use log::{error, info, trace, warn};
@@ -20,6 +21,7 @@ use super::defs;
 use super::device::SnapshotControl;
 use super::muxer::{VsockGenericMuxer, VsockMuxer};
 use super::packet::VsockPacket;
+use crate::capture::{CaptureError, CaptureGate, CaptureGeneration, CaptureResult, WorkerAck};
 use crate::device::VirtioDeviceConfig;
 use crate::{DbsGuestAddressSpace, Result as VirtioResult};
 
@@ -67,6 +69,138 @@ pub struct VsockEpollHandler<
     pub(crate) muxer: M,
     _cid: u64,
     snapshot_control: Arc<SnapshotControl>,
+    capture: CaptureGate,
+    backend_suspended: bool,
+}
+
+pub(super) struct VsockSubscriber<T>(pub(super) Arc<Mutex<T>>);
+
+impl<T: MutEventSubscriber> MutEventSubscriber for VsockSubscriber<T> {
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
+        self.0
+            .lock()
+            .expect("vsock handler lock poisoned")
+            .process(events, ops);
+    }
+
+    fn init(&mut self, ops: &mut EventOps) {
+        self.0
+            .lock()
+            .expect("vsock handler lock poisoned")
+            .init(ops);
+    }
+}
+
+pub(super) trait VsockCaptureController: Send {
+    fn hold(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck>;
+    fn resume(&mut self, generation: CaptureGeneration, deadline: Instant) -> CaptureResult<()>;
+}
+
+/// Capture control independent of the MMIO transport lock.
+#[derive(Clone)]
+pub struct VsockCaptureControl(Arc<Mutex<dyn VsockCaptureController>>);
+
+impl VsockCaptureControl {
+    pub(super) fn new<T: VsockCaptureController + 'static>(handler: Arc<Mutex<T>>) -> Self {
+        Self(handler)
+    }
+
+    fn with_handler<T>(
+        &self,
+        deadline: Instant,
+        action: impl FnOnce(&mut dyn VsockCaptureController) -> CaptureResult<T>,
+    ) -> CaptureResult<T> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(CaptureError::Timeout);
+            }
+            match self.0.try_lock() {
+                Ok(mut handler) => return action(&mut *handler),
+                Err(TryLockError::Poisoned(_)) => return Err(CaptureError::Disconnected),
+                Err(TryLockError::WouldBlock) => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Wait for the current callback and freeze all guest-memory writes.
+    pub fn request_hold(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        self.with_handler(deadline, |handler| handler.hold(generation, deadline))
+    }
+
+    /// Release the matching generation and replay queue notifications.
+    pub fn resume_capture(
+        &self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<()> {
+        self.with_handler(deadline, |handler| handler.resume(generation, deadline))
+    }
+}
+
+impl<AS, Q, R, M> VsockCaptureController for VsockEpollHandler<AS, Q, R, M>
+where
+    AS: DbsGuestAddressSpace,
+    Q: QueueT + Send,
+    R: GuestMemoryRegion + Send + Sync,
+    M: VsockGenericMuxer,
+{
+    fn hold(
+        &mut self,
+        generation: CaptureGeneration,
+        deadline: Instant,
+    ) -> CaptureResult<WorkerAck> {
+        let (reply, receiver) = mpsc::channel();
+        let _reset = loop {
+            if Instant::now() >= deadline {
+                return Err(CaptureError::Timeout);
+            }
+            match self.snapshot_control.reset_transition.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::Poisoned(_)) => return Err(CaptureError::Disconnected),
+                Err(TryLockError::WouldBlock) => std::thread::yield_now(),
+            }
+        };
+        self.capture.begin(generation, deadline, reply);
+        if self.capture.needs_ack() {
+            self.snapshot_control
+                .capture_held
+                .store(true, Ordering::Release);
+            self.capture.finish_report(Ok(self.capture.held_ack(false)));
+        }
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| CaptureError::Timeout)?
+    }
+
+    fn resume(&mut self, generation: CaptureGeneration, deadline: Instant) -> CaptureResult<()> {
+        if Instant::now() >= deadline {
+            return Err(CaptureError::Timeout);
+        }
+        if self.capture.release(generation)? {
+            self.snapshot_control
+                .capture_held
+                .store(false, Ordering::Release);
+            for queue in &self.config.queues {
+                queue
+                    .eventfd
+                    .write(1)
+                    .map_err(|e| CaptureError::ControlIo(e.to_string()))?;
+            }
+            self.snapshot_control
+                .handler_ready_event
+                .write(1)
+                .map_err(|e| CaptureError::ControlIo(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 impl<AS, Q, R, M> VsockEpollHandler<AS, Q, R, M>
@@ -82,13 +216,22 @@ where
         cid: u64,
         muxer: M,
         snapshot_control: Arc<SnapshotControl>,
+        capture_id: String,
+        generation: Option<CaptureGeneration>,
     ) -> Self {
+        let mut capture = CaptureGate::armed(capture_id, generation);
+        if capture.is_held() {
+            snapshot_control.capture_held.store(true, Ordering::Release);
+            capture.finish_report(Ok(capture.held_ack(false)));
+        }
         VsockEpollHandler {
             config,
             id,
             _cid: cid,
             muxer,
             snapshot_control,
+            capture,
+            backend_suspended: false,
         }
     }
 
@@ -282,7 +425,42 @@ where
     R: GuestMemoryRegion,
     M: VsockGenericMuxer + 'static,
 {
-    fn process(&mut self, events: Events, _ops: &mut EventOps) {
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
+        if self.capture.is_held() {
+            match events.data() {
+                defs::RXQ_EVENT | defs::TXQ_EVENT | defs::EVQ_EVENT => {
+                    let _ = self.config.queues[events.data() as usize].consume_event();
+                }
+                defs::BACKEND_EVENT if !self.backend_suspended => {
+                    if let Err(err) = ops.remove(Events::with_data_raw(
+                        self.muxer.as_raw_fd(),
+                        defs::BACKEND_EVENT,
+                        EventSet::IN,
+                    )) {
+                        error!("{}: failed to suspend backend: {:?}", self.id, err);
+                    } else {
+                        self.backend_suspended = true;
+                    }
+                }
+                defs::HANDLER_READY_EVENT => {
+                    let ready = self.snapshot_control.handler_ready_event.read().is_ok();
+                    self.snapshot_control.complete_handler_registration(ready);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.backend_suspended {
+            let event_set = EventSet::from_bits(self.muxer.get_polled_evset().bits()).unwrap();
+            match ops.add(Events::with_data_raw(
+                self.muxer.as_raw_fd(),
+                defs::BACKEND_EVENT,
+                event_set,
+            )) {
+                Ok(()) => self.backend_suspended = false,
+                Err(err) => error!("{}: failed to resume backend: {:?}", self.id, err),
+            }
+        }
         let guard = self.config.lock_guest_memory();
         let mem = guard.deref();
 
@@ -348,7 +526,9 @@ where
         let be_fd = self.muxer.as_raw_fd();
         let be_evset = EventSet::from_bits(self.muxer.get_polled_evset().bits()).unwrap();
         let events = Events::with_data_raw(be_fd, defs::BACKEND_EVENT, be_evset);
-        if let Err(e) = ops.add(events) {
+        if self.capture.is_held() {
+            self.backend_suspended = true;
+        } else if let Err(e) = ops.add(events) {
             registration_ready = false;
             error!(
                 "{}: failed to register epoll event for backend fd: {:?}, {:?}.",
@@ -404,7 +584,8 @@ where
 mod tests {
     use std::any::Any;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Mutex, TryLockError};
+    use std::time::Instant;
 
     use dbs_interrupt::InterruptNotifier;
     use test_utils::skip_if_kvm_unaccessable;

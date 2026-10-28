@@ -242,6 +242,9 @@ impl VsockDeviceMgr {
                 .map_err(VirtioError::VirtioVsockError)
                 .map_err(StartMicroVmError::CreateVsockDevice)?,
             );
+            device
+                .set_capture_id(format!("vsock:{}", info.config.id))
+                .map_err(StartMicroVmError::CreateVsockDevice)?;
             if let Some(uds_path) = info.config.uds_path.as_ref() {
                 let unix_backend = VsockUnixStreamBackend::new(uds_path.clone())
                     .map_err(VirtioError::VirtioVsockError)
@@ -392,9 +395,9 @@ impl<'a> dbs_snapshot::Persist<'a> for VsockDeviceMgr {
 
     /// Capture the state of all vsock devices.
     ///
-    /// The virtual machine must be paused when this is called. Live vsock
-    /// connection state is not captured: snapshots must be taken at a clean
-    /// quiesce point with no active connections.
+    /// The virtual machine and device handler must be quiesced. Host connections
+    /// are not persisted; restore requires transport reset acknowledgement
+    /// before reconnecting the guest agent.
     fn save_state(
         &mut self,
         reset_transport: bool,

@@ -180,10 +180,6 @@ impl Vm {
             .map_err(|e| SnapshotError::InvalidState(e.to_string()))?
             .capture_save(msrs.as_slice(), deadline)?;
         let mut state = self.snapshot_metadata_paused(states, false)?;
-        #[cfg(feature = "virtio-vsock")]
-        {
-            state.device_states.vsock = None;
-        }
         state.capture_cpu = Some(CpuRequirements {
             cpuid: host_cpu_requirements(&self.kvm)?,
             msr_indices: msrs.as_slice().to_vec(),
@@ -573,6 +569,7 @@ impl Vm {
                     && name != "virtio_net"
                     && !(cfg!(feature = "virtio-balloon") && name == "balloon")
                     && !(cfg!(feature = "virtio-fs") && name == "fs")
+                    && !(cfg!(feature = "virtio-vsock") && name == "vsock")
                     && !value.is_null()
             }) {
                 return Err(SnapshotError::InvalidSnapshot(
@@ -654,6 +651,40 @@ impl Vm {
                 {
                     return Err(SnapshotError::InvalidSnapshot(
                         "unsupported filesystem state or queue set".into(),
+                    ));
+                }
+            }
+        }
+        #[cfg(feature = "virtio-vsock")]
+        {
+            let saved = state
+                .device_states
+                .vsock
+                .as_ref()
+                .map(|state| state.devices.as_slice())
+                .unwrap_or(&[]);
+            let configured = &self.device_manager.vsock_manager.info_list;
+            if saved.len() != configured.len() {
+                return Err(SnapshotError::InvalidSnapshot(
+                    "vsock device set mismatch".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for device in saved {
+                let config = configured
+                    .iter()
+                    .find(|info| info.config.id == device.config.id)
+                    .ok_or_else(|| SnapshotError::InvalidSnapshot("unknown vsock device".into()))?;
+                let crate::device_manager::persist::VirtioTransportState::Mmio(transport) =
+                    &device.transport;
+                if !seen.insert(&device.config.id)
+                    || config.config.guest_cid != device.config.guest_cid
+                    || config.config.queue_sizes() != device.config.queue_sizes()
+                    || transport.queues.len() != dbs_virtio_devices::vsock::NUM_QUEUES
+                    || !transport.device_activated
+                {
+                    return Err(SnapshotError::InvalidSnapshot(
+                        "unsupported vsock state or queue set".into(),
                     ));
                 }
             }
@@ -852,6 +883,12 @@ impl Vm {
                 .lock()
                 .unwrap()
                 .restore_state(fs, ())?;
+        }
+        #[cfg(feature = "virtio-vsock")]
+        if let Some(vsock) = &state.device_states.vsock {
+            self.device_manager
+                .vsock_manager
+                .restore_state(vsock, true)?;
         }
         #[cfg(feature = "virtio-balloon")]
         if let Some(balloon) = &state.device_states.balloon {

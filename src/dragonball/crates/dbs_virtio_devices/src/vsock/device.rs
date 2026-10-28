@@ -30,9 +30,10 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::backend::VsockBackend;
 use super::defs::uapi;
-use super::epoll_handler::VsockEpollHandler;
+use super::epoll_handler::{VsockCaptureControl, VsockEpollHandler, VsockSubscriber};
 use super::muxer::{Error as MuxerError, VsockGenericMuxer, VsockMuxer};
 use super::{Result, VsockError};
+use crate::capture::{CaptureError, CaptureGeneration, CaptureResult};
 use crate::device::{VirtioDeviceConfig, VirtioDeviceInfo};
 use crate::{ActivateResult, ConfigResult, DbsGuestAddressSpace, VirtioDevice, VirtioQueueConfig};
 
@@ -92,6 +93,9 @@ pub struct Vsock<AS: GuestAddressSpace, M: VsockGenericMuxer = VsockMuxer> {
     local_port_watermark: Arc<AtomicU32>,
     snapshot_control: Arc<SnapshotControl>,
     phantom: PhantomData<AS>,
+    capture_controller: Option<VsockCaptureControl>,
+    capture_id: String,
+    capture_on_activate: Option<CaptureGeneration>,
 }
 
 type SnapshotPrepare = Box<dyn Fn() -> crate::Result<u16> + Send + Sync>;
@@ -104,7 +108,8 @@ pub(super) struct SnapshotControl {
     reset_generation: AtomicU64,
     handler_registration: AtomicU8,
     pub(super) handler_ready_event: Arc<EventFd>,
-    reset_transition: Mutex<()>,
+    pub(super) reset_transition: Mutex<()>,
+    pub(super) capture_held: AtomicBool,
     prepare: Mutex<Option<SnapshotPrepare>>,
     ack_probe: Mutex<Option<SnapshotAckProbe>>,
 }
@@ -119,6 +124,7 @@ impl SnapshotControl {
             handler_registration: AtomicU8::new(HANDLER_REGISTRATION_PENDING),
             handler_ready_event: Arc::new(EventFd::new(EFD_NONBLOCK)?),
             reset_transition: Mutex::new(()),
+            capture_held: AtomicBool::new(false),
             prepare: Mutex::new(None),
             ack_probe: Mutex::new(None),
         })
@@ -150,6 +156,9 @@ impl SnapshotControl {
 
     pub(super) fn request_reset(&self) -> crate::Result<bool> {
         let _transition = self.reset_transition.lock().unwrap();
+        if self.capture_held.load(Ordering::Acquire) {
+            return Err(crate::Error::InvalidInput);
+        }
         if !self.reset_on_restore.swap(false, Ordering::AcqRel) {
             return Ok(false);
         }
@@ -202,6 +211,9 @@ impl SnapshotControl {
         // observed for generation N can clear the pending bit after generation
         // N+1 has reused it (a boolean ABA race).
         let _transition = self.reset_transition.lock().unwrap();
+        if self.capture_held.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         if !self.pending_event_ack.load(Ordering::Acquire) {
             return Ok(true);
         }
@@ -334,7 +346,41 @@ impl<AS: GuestAddressSpace, M: VsockGenericMuxer> Vsock<AS, M> {
                 SnapshotControl::new().map_err(VsockError::HandlerReadyEvent)?,
             ),
             phantom: PhantomData,
+            capture_controller: None,
+            capture_id: format!("vsock:{cid}"),
+            capture_on_activate: None,
         })
+    }
+
+    /// Assign the configured device identity before activation.
+    pub fn set_capture_id(&mut self, id: String) -> crate::Result<()> {
+        if id.is_empty() || self.capture_controller.is_some() {
+            return Err(crate::Error::InvalidInput);
+        }
+        self.capture_id = id;
+        Ok(())
+    }
+
+    /// Arm a restored device before it registers its event handler.
+    pub fn arm_capture(&mut self, generation: CaptureGeneration) -> CaptureResult<()> {
+        if generation.0 == 0
+            || self.capture_controller.is_some()
+            || self.capture_on_activate.is_some()
+        {
+            return Err(CaptureError::StaleGeneration);
+        }
+        self.capture_on_activate = Some(generation);
+        Ok(())
+    }
+
+    /// Obtain control without holding the MMIO transport lock while waiting.
+    pub fn capture_control(&self) -> CaptureResult<VsockCaptureControl> {
+        if self.subscriber_id.is_none() {
+            return Err(CaptureError::Disconnected);
+        }
+        self.capture_controller
+            .clone()
+            .ok_or(CaptureError::Disconnected)
     }
 
     pub fn handler_ready(&self) -> bool {
@@ -393,8 +439,9 @@ impl<'a, AS: GuestAddressSpace, M: VsockGenericMuxer> crate::persist::VirtioDevi
 
     /// Capture the guest-negotiated state of this device.
     ///
-    /// Live vsock connection state is not captured: a snapshot must be taken
-    /// at a clean quiesce point with no active connections.
+    /// The handler must be quiesced before capture. Host connections are not
+    /// persisted; a restored guest must acknowledge a transport reset before
+    /// the runtime reconnects its agent.
     fn save_state(&mut self, reset_transport: bool) -> crate::Result<Self::State> {
         if reset_transport {
             self.snapshot_control.queue_snapshot_reset()?;
@@ -504,10 +551,17 @@ where
             // safe to unwrap, because we create muxer using New()
             self.muxer.take().unwrap(),
             self.snapshot_control.clone(),
+            self.capture_id.clone(),
+            self.capture_on_activate,
         );
+        let handler = Arc::new(Mutex::new(handler));
+        self.capture_controller = Some(VsockCaptureControl::new(handler.clone()));
 
         self.snapshot_control.begin_handler_registration();
-        self.subscriber_id = Some(self.device_info.register_event_handler(Box::new(handler)));
+        self.subscriber_id = Some(
+            self.device_info
+                .register_event_handler(Box::new(VsockSubscriber(handler))),
+        );
 
         Ok(())
     }
@@ -536,6 +590,7 @@ where
     }
 
     fn remove(&mut self) {
+        self.capture_controller = None;
         let subscriber_id = self.subscriber_id.take();
         if let Some(subscriber_id) = subscriber_id {
             match self.device_info.remove_event_handler(subscriber_id) {
@@ -599,10 +654,97 @@ mod tests {
                     // safe to unwrap, because we create muxer using New()
                     self.muxer.take().unwrap(),
                     self.snapshot_control.clone(),
+                    self.capture_id.clone(),
+                    self.capture_on_activate,
                 );
 
             Ok(handler)
         }
+    }
+
+    #[test]
+    fn capture_vsock_defers_queue_and_reset_writes_until_release() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        ctx._guest_evvq
+            .dtable(0)
+            .set(0x0060_0000, 4, VIRTQ_DESC_F_WRITE, 0);
+        ctx._guest_evvq.avail.ring(0).store(0);
+        ctx._guest_evvq.avail.idx().store(1);
+        let manager = ctx.device.device_info.epoll_manager.clone();
+        let tx_event = ctx.queues[1].eventfd.clone();
+        let config = VirtioDeviceConfig::<Arc<GuestMemoryMmap<()>>, QueueSync>::new(
+            ctx.mem.clone(),
+            create_address_space(),
+            Arc::new(Kvm::new().unwrap().create_vm().unwrap()),
+            DeviceResources::new(),
+            ctx.queues.drain(..).collect(),
+            None,
+            Arc::new(NoopNotifier::new()),
+        );
+        ctx.device.set_capture_id("vsock:agent".into()).unwrap();
+        ctx.device.activate(config).unwrap();
+        let control = ctx.device.capture_control().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let ack = control
+            .request_hold(CaptureGeneration(1), deadline)
+            .unwrap();
+        assert_eq!(ack.device_id, "vsock:agent");
+        assert_eq!(ack.memory_writers, 0);
+        tx_event.write(1).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(ctx.guest_txvq.used.idx().load(), 0);
+        ctx.device.schedule_transport_reset();
+        assert!(ctx.device.request_transport_reset().is_err());
+        assert_eq!(ctx._guest_evvq.used.idx().load(), 0);
+        assert_eq!(
+            control.resume_capture(CaptureGeneration(2), deadline),
+            Err(CaptureError::StaleGeneration)
+        );
+        assert!(ctx.device.request_transport_reset().is_err());
+        control
+            .resume_capture(CaptureGeneration(1), deadline)
+            .unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(ctx.guest_txvq.used.idx().load(), 1);
+        assert!(ctx.device.request_transport_reset().unwrap());
+        assert_eq!(ctx._guest_evvq.used.idx().load(), 1);
+    }
+
+    #[test]
+    fn capture_vsock_restore_is_held_before_first_callback() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_event_handler_context();
+        let manager = ctx.device.device_info.epoll_manager.clone();
+        let tx_event = ctx.queues[1].eventfd.clone();
+        let config = VirtioDeviceConfig::<Arc<GuestMemoryMmap<()>>, QueueSync>::new(
+            ctx.mem.clone(),
+            create_address_space(),
+            Arc::new(Kvm::new().unwrap().create_vm().unwrap()),
+            DeviceResources::new(),
+            ctx.queues.drain(..).collect(),
+            None,
+            Arc::new(NoopNotifier::new()),
+        );
+        ctx.device.arm_capture(CaptureGeneration(9)).unwrap();
+        ctx.device.activate(config).unwrap();
+        tx_event.write(1).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(ctx.guest_txvq.used.idx().load(), 0);
+        let control = ctx.device.capture_control().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            control
+                .request_hold(CaptureGeneration(9), deadline)
+                .unwrap()
+                .generation,
+            9
+        );
+        control
+            .resume_capture(CaptureGeneration(9), deadline)
+            .unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(ctx.guest_txvq.used.idx().load(), 1);
     }
 
     #[test]

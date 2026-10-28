@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Complete device-set barrier for the qualified MMIO block/net profile.
+//! Device-set capture barriers for supported MMIO devices.
 
 use super::blk_dev_mgr::BlockDeviceType;
 use super::net_dev_mgr::Backend;
@@ -63,6 +63,8 @@ enum CaptureControl {
     Net(NetCaptureControl),
     #[cfg(feature = "virtio-fs")]
     Fs(dbs_virtio_devices::fs::FsCaptureControl),
+    #[cfg(feature = "virtio-vsock")]
+    Vsock(dbs_virtio_devices::vsock::VsockCaptureControl),
     #[cfg(feature = "virtio-balloon")]
     Balloon(dbs_virtio_devices::balloon::BalloonCaptureControl),
 }
@@ -86,6 +88,8 @@ impl CaptureTarget {
             CaptureControl::Net(control) => control.request_hold(generation, deadline),
             #[cfg(feature = "virtio-fs")]
             CaptureControl::Fs(control) => control.request_hold(generation, deadline),
+            #[cfg(feature = "virtio-vsock")]
+            CaptureControl::Vsock(control) => control.request_hold(generation, deadline),
             #[cfg(feature = "virtio-balloon")]
             CaptureControl::Balloon(control) => control.request_hold(generation, deadline),
         }
@@ -97,6 +101,8 @@ impl CaptureTarget {
             CaptureControl::Net(control) => control.resume_capture(generation, deadline),
             #[cfg(feature = "virtio-fs")]
             CaptureControl::Fs(control) => control.resume_capture(generation, deadline),
+            #[cfg(feature = "virtio-vsock")]
+            CaptureControl::Vsock(control) => control.resume_capture(generation, deadline),
             #[cfg(feature = "virtio-balloon")]
             CaptureControl::Balloon(control) => control.resume_capture(generation, deadline),
         }
@@ -178,6 +184,15 @@ impl DeviceManager {
 
     /// Arm all fresh MMIO devices before any activation is replayed.
     pub(crate) fn arm_capture_restore(&mut self, generation: CaptureGeneration) -> Result<()> {
+        #[cfg(feature = "virtio-vsock")]
+        for info in self.vsock_manager.info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached vsock".into()))?;
+            super::persist::arm_device_capture(device, generation)
+                .map_err(|e| DeviceCaptureError::Rejected(e.to_string()))?;
+        }
         #[cfg(feature = "virtio-balloon")]
         for info in self.balloon_manager.info_list.iter() {
             let device = info
@@ -217,9 +232,14 @@ impl DeviceManager {
 
     pub(crate) fn validate_capture_profile(&self) -> Result<()> {
         #[cfg(feature = "virtio-vsock")]
-        if !self.vsock_manager.info_list.is_empty() {
+        if self
+            .vsock_manager
+            .info_list
+            .iter()
+            .any(|info| info.config.id.is_empty())
+        {
             return Err(DeviceCaptureError::Rejected(
-                "virtio-vsock memory writer is unsupported".to_string(),
+                "empty vsock device identity".into(),
             ));
         }
         #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
@@ -306,6 +326,24 @@ impl DeviceManager {
     fn capture_targets(&self, deadline: Instant) -> Result<Vec<CaptureTarget>> {
         self.validate_capture_profile()?;
         let mut targets = Vec::new();
+        #[cfg(feature = "virtio-vsock")]
+        for info in self.vsock_manager.info_list.iter() {
+            use dbs_virtio_devices::vsock::Vsock;
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached vsock".into()))?;
+            let control = device_control::<Vsock<GuestAddressSpaceImpl>, _>(
+                device,
+                deadline,
+                Vsock::capture_control,
+            )?;
+            targets.push(CaptureTarget {
+                id: format!("vsock:{}", info.config.id),
+                flush_required: false,
+                control: CaptureControl::Vsock(control),
+            });
+        }
         #[cfg(feature = "virtio-balloon")]
         for info in self.balloon_manager.info_list.iter() {
             use dbs_virtio_devices::balloon::Balloon;
