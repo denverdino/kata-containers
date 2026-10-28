@@ -61,6 +61,8 @@ fn validate_acks(
 enum CaptureControl {
     Block(WorkerCaptureControl),
     Net(NetCaptureControl),
+    #[cfg(feature = "virtio-fs")]
+    Fs(dbs_virtio_devices::fs::FsCaptureControl),
     #[cfg(feature = "virtio-balloon")]
     Balloon(dbs_virtio_devices::balloon::BalloonCaptureControl),
 }
@@ -82,6 +84,8 @@ impl CaptureTarget {
         match &self.control {
             CaptureControl::Block(control) => control.request_hold(generation, deadline),
             CaptureControl::Net(control) => control.request_hold(generation, deadline),
+            #[cfg(feature = "virtio-fs")]
+            CaptureControl::Fs(control) => control.request_hold(generation, deadline),
             #[cfg(feature = "virtio-balloon")]
             CaptureControl::Balloon(control) => control.request_hold(generation, deadline),
         }
@@ -91,6 +95,8 @@ impl CaptureTarget {
         match &self.control {
             CaptureControl::Block(control) => control.resume(generation, deadline),
             CaptureControl::Net(control) => control.resume_capture(generation, deadline),
+            #[cfg(feature = "virtio-fs")]
+            CaptureControl::Fs(control) => control.resume_capture(generation, deadline),
             #[cfg(feature = "virtio-balloon")]
             CaptureControl::Balloon(control) => control.resume_capture(generation, deadline),
         }
@@ -181,6 +187,15 @@ impl DeviceManager {
             super::persist::arm_device_capture(device, generation)
                 .map_err(|e| DeviceCaptureError::Rejected(e.to_string()))?;
         }
+        #[cfg(feature = "virtio-fs")]
+        for info in self.fs_manager.lock().unwrap().info_list.iter() {
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached fs".into()))?;
+            super::persist::arm_device_capture(device, generation)
+                .map_err(|e| DeviceCaptureError::Rejected(e.to_string()))?;
+        }
         for info in self.block_manager.iter() {
             let device = info
                 .device
@@ -208,16 +223,23 @@ impl DeviceManager {
             ));
         }
         #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
-        if !self
+        for info in self
             .fs_manager
             .try_lock()
-            .map_err(|_| DeviceCaptureError::Rejected("fs inventory unavailable".to_string()))?
+            .map_err(|_| DeviceCaptureError::Rejected("fs inventory unavailable".into()))?
             .info_list
-            .is_empty()
+            .iter()
         {
-            return Err(DeviceCaptureError::Rejected(
-                "virtio-fs memory writer is unsupported".to_string(),
-            ));
+            if !cfg!(feature = "virtio-fs")
+                || info.config.mode != "virtio"
+                || info.config.tag.is_empty()
+                || info.config.cache_size != 0
+                || info.config.thread_pool_size != 0
+            {
+                return Err(DeviceCaptureError::Rejected(
+                    "unsupported inline fs capture profile".into(),
+                ));
+            }
         }
         #[cfg(feature = "virtio-mem")]
         if !self.mem_manager.info_list.is_empty() {
@@ -300,6 +322,23 @@ impl DeviceManager {
                 id: format!("balloon:{}", info.config.balloon_id),
                 flush_required: false,
                 control: CaptureControl::Balloon(control),
+            });
+        }
+        #[cfg(feature = "virtio-fs")]
+        for info in self.fs_manager.lock().unwrap().info_list.iter() {
+            use dbs_virtio_devices::fs::VirtioFs;
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached fs".into()))?;
+            let control = device_control::<
+                VirtioFs<GuestAddressSpaceImpl, vm_memory::bitmap::AtomicBitmap>,
+                _,
+            >(device, deadline, VirtioFs::capture_control)?;
+            targets.push(CaptureTarget {
+                id: format!("fs:{}", info.config.tag),
+                flush_required: false,
+                control: CaptureControl::Fs(control),
             });
         }
         for info in self.block_manager.iter() {

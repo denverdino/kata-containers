@@ -184,10 +184,6 @@ impl Vm {
         {
             state.device_states.vsock = None;
         }
-        #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
-        {
-            state.device_states.fs = None;
-        }
         state.capture_cpu = Some(CpuRequirements {
             cpuid: host_cpu_requirements(&self.kvm)?,
             msr_indices: msrs.as_slice().to_vec(),
@@ -576,6 +572,7 @@ impl Vm {
                 name != "block"
                     && name != "virtio_net"
                     && !(cfg!(feature = "virtio-balloon") && name == "balloon")
+                    && !(cfg!(feature = "virtio-fs") && name == "fs")
                     && !value.is_null()
             }) {
                 return Err(SnapshotError::InvalidSnapshot(
@@ -618,6 +615,45 @@ impl Vm {
                 {
                     return Err(SnapshotError::InvalidSnapshot(
                         "unsupported balloon state or queue set".into(),
+                    ));
+                }
+            }
+        }
+        #[cfg(feature = "virtio-fs")]
+        {
+            let saved = state
+                .device_states
+                .fs
+                .as_ref()
+                .map(|fs| fs.devices.as_slice())
+                .unwrap_or(&[]);
+            let manager = self.device_manager.fs_manager.lock().unwrap();
+            if saved.len() != manager.info_list.len() {
+                return Err(SnapshotError::InvalidSnapshot(
+                    "filesystem device set mismatch".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for device in saved {
+                let configured = manager
+                    .info_list
+                    .iter()
+                    .find(|info| info.config.tag == device.config.tag)
+                    .ok_or_else(|| {
+                        SnapshotError::InvalidSnapshot("unknown filesystem device".into())
+                    })?;
+                let crate::device_manager::persist::VirtioTransportState::Mmio(transport) =
+                    &device.transport;
+                if !seen.insert(&device.config.tag)
+                    || serde_json::to_value(&configured.config)
+                        .map_err(crate::snapshot::PersistError::from)?
+                        != serde_json::to_value(&device.config)
+                            .map_err(crate::snapshot::PersistError::from)?
+                    || transport.queues.len() != device.config.num_queues + 1
+                    || !transport.device_activated
+                {
+                    return Err(SnapshotError::InvalidSnapshot(
+                        "unsupported filesystem state or queue set".into(),
                     ));
                 }
             }
@@ -808,6 +844,14 @@ impl Vm {
         }
         if let Some(net) = &state.device_states.virtio_net {
             self.device_manager.net_manager.restore_state(net, ())?;
+        }
+        #[cfg(feature = "virtio-fs")]
+        if let Some(fs) = &state.device_states.fs {
+            self.device_manager
+                .fs_manager
+                .lock()
+                .unwrap()
+                .restore_state(fs, ())?;
         }
         #[cfg(feature = "virtio-balloon")]
         if let Some(balloon) = &state.device_states.balloon {

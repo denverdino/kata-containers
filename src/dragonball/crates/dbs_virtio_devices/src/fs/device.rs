@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use caps::{CapSet, Capability};
@@ -43,6 +43,9 @@ use crate::{
     TYPE_VIRTIO_FS,
 };
 
+use super::capture::{FsCaptureControl, FsSubscriber};
+use crate::capture::{CaptureError, CaptureGate, CaptureGeneration, CaptureResult};
+
 use super::{
     CacheHandler, Error as FsError, Result as FsResult, VirtioFsEpollHandler, VIRTIO_FS_NAME,
 };
@@ -67,7 +70,7 @@ pub(crate) const RAFS: &str = "rafs";
 pub struct BackendFsInfo {
     pub(crate) index: VfsIndex,
     pub(crate) fstype: String,
-    // (source, config), only suitable for Rafs
+    // Source path and backend configuration (empty for passthrough).
     pub(crate) src_cfg: Option<(String, String)>,
 }
 
@@ -91,6 +94,8 @@ pub struct VirtioFs<AS: GuestAddressSpace, B: NewBitmap = ()> {
     pub(crate) rate_limiter: Option<RateLimiter>,
     pub(crate) patch_rate_limiter_fd: EventFd,
     pub(crate) sender: Option<mpsc::Sender<(BucketUpdate, BucketUpdate)>>,
+    capture_controller: Option<FsCaptureControl>,
+    capture_on_activate: Option<CaptureGeneration>,
     phantom: PhantomData<AS>,
 }
 
@@ -123,6 +128,56 @@ where
 
 #[allow(clippy::too_many_arguments)]
 impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
+    /// Validate the filesystem profile before the VMM pauses its vCPUs.
+    pub fn validate_capture_profile(&self) -> Result<()> {
+        if self.cache_size != 0 || self.thread_pool_size != 0 {
+            return Err(Error::InvalidInput);
+        }
+        for (path, info) in &self.backend_fs {
+            if info.fstype != PASSTHROUGHFS || info.src_cfg.is_none() {
+                return Err(Error::InvalidInput);
+            }
+            let (backend, index) = self
+                .fs
+                .get_rootfs(path)
+                .map_err(|_| Error::InvalidInput)?
+                .ok_or(Error::InvalidInput)?;
+            if index != info.index {
+                return Err(Error::InvalidInput);
+            }
+            backend
+                .as_any()
+                .downcast_ref::<PassthroughFs<()>>()
+                .ok_or(Error::InvalidInput)?
+                .validate_snapshot()
+                .map_err(Error::IOError)?;
+        }
+        Ok(())
+    }
+
+    /// Arm restored handlers before activation can dispatch a request.
+    pub fn arm_capture(&mut self, generation: CaptureGeneration) -> CaptureResult<()> {
+        if generation.0 == 0
+            || self.capture_on_activate.is_some()
+            || self.capture_controller.is_some()
+        {
+            return Err(CaptureError::StaleGeneration);
+        }
+        self.validate_capture_profile()
+            .map_err(|e| CaptureError::ControlIo(e.to_string()))?;
+        self.capture_on_activate = Some(generation);
+        Ok(())
+    }
+
+    /// Clone control so the caller can release the MMIO transport lock first.
+    pub fn capture_control(&self) -> CaptureResult<FsCaptureControl> {
+        self.validate_capture_profile()
+            .map_err(|e| CaptureError::ControlIo(e.to_string()))?;
+        self.capture_controller
+            .clone()
+            .ok_or(CaptureError::Disconnected)
+    }
+
     /// Create a new virtiofs device.
     pub fn new(
         tag: &str,
@@ -228,6 +283,8 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
             rate_limiter,
             patch_rate_limiter_fd: EventFd::new(0).unwrap(),
             sender: None,
+            capture_controller: None,
+            capture_on_activate: None,
             phantom: PhantomData,
         })
     }
@@ -401,12 +458,11 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
         }
     }
 
-    fn mount_passthroughfs(
+    fn new_passthroughfs(
         &mut self,
         source: String,
-        mountpoint: &str,
         dax_threshold_size_kb: Option<u64>,
-    ) -> FsResult<()> {
+    ) -> FsResult<PassthroughFs<()>> {
         debug!("http_server passthrough");
         let timeout = self.get_timeout();
 
@@ -434,6 +490,16 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
         passthrough_fs.import().map_err(FsError::IOError)?;
         debug!("passthroughfs mounted");
 
+        Ok(passthrough_fs)
+    }
+
+    fn mount_passthroughfs(
+        &mut self,
+        source: String,
+        mountpoint: &str,
+        dax_threshold_size_kb: Option<u64>,
+    ) -> FsResult<()> {
+        let passthrough_fs = self.new_passthroughfs(source.clone(), dax_threshold_size_kb)?;
         let fs = Box::new(passthrough_fs);
         match self.fs.mount(fs, mountpoint) {
             Ok(idx) => {
@@ -442,7 +508,7 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
                     BackendFsInfo {
                         index: idx,
                         fstype: PASSTHROUGHFS.to_string(),
-                        src_cfg: None,
+                        src_cfg: Some((source, String::new())),
                     },
                 );
                 Ok(())
@@ -734,28 +800,108 @@ fn set_default_rlimit_nofile() -> Result<()> {
     }
 }
 
+/// Inline filesystem state, including guest references into each backend.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VirtioFsState {
+    /// Guest-negotiated virtio features and configuration.
+    pub device_info: crate::persist::VirtioDeviceInfoState,
+    /// Vfs inode namespace and negotiated FUSE options.
+    pub vfs: Vec<u8>,
+    /// Mounted passthrough filesystem state.
+    pub backends: Vec<PassthroughMountState>,
+}
+
+/// A passthrough mount with its original Vfs index.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PassthroughMountState {
+    /// Trusted host share path, validated by the snapshot consumer.
+    pub source: String,
+    /// Guest Vfs mount point.
+    pub mountpoint: String,
+    /// Guest-visible backend index.
+    pub index: VfsIndex,
+    /// Guest inode and file-handle references.
+    pub state: fuse_backend_rs::passthrough::persist::PassthroughState,
+}
+
 impl<'a, AS: GuestAddressSpace, B: NewBitmap> crate::persist::VirtioDevicePersist<'a>
     for VirtioFs<AS, B>
 {
-    type State = crate::persist::VirtioDeviceInfoState;
+    type State = VirtioFsState;
     type SaveArgs = ();
     type RestoreArgs = ();
     type Error = crate::Error;
 
-    /// Capture the guest-negotiated state of this device.
-    ///
-    /// Backend filesystem state (open handles, inodes, DAX mappings) is not
-    /// captured: a snapshot must be taken at a clean quiesce point.
     fn save_state(&mut self, _args: ()) -> crate::Result<Self::State> {
-        Ok(self.device_info.save_state())
+        let control = self.capture_control().map_err(|_| Error::InvalidInput)?;
+        if !control.is_held().map_err(|_| Error::InvalidInput)? {
+            return Err(Error::InvalidInput);
+        }
+        let mut backends = Vec::new();
+        for (mountpoint, info) in &self.backend_fs {
+            let (backend, _) = self
+                .fs
+                .get_rootfs(mountpoint)
+                .map_err(|_| Error::InvalidInput)?
+                .ok_or(Error::InvalidInput)?;
+            let backend = backend
+                .as_any()
+                .downcast_ref::<PassthroughFs<()>>()
+                .ok_or(Error::InvalidInput)?;
+            backends.push(PassthroughMountState {
+                source: info.src_cfg.as_ref().ok_or(Error::InvalidInput)?.0.clone(),
+                mountpoint: mountpoint.clone(),
+                index: info.index,
+                state: backend.save_state().map_err(Error::IOError)?,
+            });
+        }
+        backends.sort_by(|a, b| a.mountpoint.cmp(&b.mountpoint));
+        Ok(VirtioFsState {
+            device_info: self.device_info.save_state(),
+            vfs: self.fs.save_to_bytes().map_err(|_| Error::InvalidInput)?,
+            backends,
+        })
     }
 
-    /// Restore the guest-negotiated state of this device.
-    ///
-    /// The device must have been re-created with the same configuration and
-    /// must not have been activated yet.
     fn restore_state(&mut self, state: &Self::State, _args: ()) -> crate::Result<()> {
-        self.device_info.restore_state(state)
+        self.validate_capture_profile()?;
+        if self.subscriber_id.is_some()
+            || self.capture_on_activate.is_none()
+            || !self.backend_fs.is_empty()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.restore_from_bytes(&mut state.vfs.clone())
+            .map_err(|_| Error::InvalidInput)?;
+        let mut mounts = HashMap::new();
+        let mut indices = std::collections::HashSet::new();
+        for backend in &state.backends {
+            if backend.index == 0
+                || !indices.insert(backend.index)
+                || mounts.contains_key(&backend.mountpoint)
+            {
+                return Err(Error::InvalidInput);
+            }
+            let fs = self
+                .new_passthroughfs(backend.source.clone(), None)
+                .map_err(|_| Error::InvalidInput)?;
+            fs.restore_state(&backend.state).map_err(Error::IOError)?;
+            vfs.restore_mount(Box::new(fs), backend.index, &backend.mountpoint)
+                .map_err(Error::IOError)?;
+            mounts.insert(
+                backend.mountpoint.clone(),
+                BackendFsInfo {
+                    index: backend.index,
+                    fstype: PASSTHROUGHFS.into(),
+                    src_cfg: Some((backend.source.clone(), String::new())),
+                },
+            );
+        }
+        self.device_info.restore_state(&state.device_info)?;
+        self.fs = Arc::new(vfs);
+        self.backend_fs = mounts;
+        Ok(())
     }
 }
 
@@ -844,7 +990,7 @@ where
             None
         };
 
-        let handler = VirtioFsEpollHandler::new(
+        let mut handler = VirtioFsEpollHandler::new(
             config,
             self.fs.clone(),
             cache_handler,
@@ -855,7 +1001,18 @@ where
             Some(receiver),
         );
 
-        self.subscriber_id = Some(self.device_info.register_event_handler(Box::new(handler)));
+        handler.capture = CaptureGate::armed(format!("fs:{}", self.id), self.capture_on_activate);
+        if handler.capture.is_held() {
+            handler
+                .capture
+                .finish_report(Ok(handler.capture.held_ack(false)));
+        }
+        let handler = Arc::new(Mutex::new(handler));
+        self.capture_controller = Some(FsCaptureControl(handler.clone()));
+        self.subscriber_id = Some(
+            self.device_info
+                .register_event_handler(Box::new(FsSubscriber(handler))),
+        );
 
         Ok(())
     }
@@ -1821,5 +1978,131 @@ pub mod tests {
         assert_eq!(content.kvm_userspace_memory_region_slot, 0);
         assert_eq!(content.region_list[0].offset, 0);
         assert_eq!(content.region_list[0].len, 0x1000);
+    }
+    #[test]
+    fn test_capture_profile_rejects_dax_and_detached_workers() {
+        for (cache_size, threads, supported) in [(0, 0, true), (0x200000, 0, false), (0, 1, false)]
+        {
+            let fs: VirtioFs<Arc<GuestMemoryMmap>> = VirtioFs::new(
+                TAG,
+                NUM_QUEUES,
+                QUEUE_SIZE,
+                cache_size,
+                "auto",
+                threads,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                new_dummy_handler_helper(),
+                EpollManager::default(),
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(fs.validate_capture_profile().is_ok(), supported);
+        }
+    }
+    #[test]
+    fn held_filesystem_does_not_write_guest_memory_until_release() {
+        use crate::memory_tracking::tests::{descriptor, queue};
+        use fuse_backend_rs::abi::fuse_abi::{InHeader, InitIn, Opcode};
+        use std::time::Instant;
+        use vm_memory::Bytes;
+        let manager = EpollManager::default();
+        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+        let queues = vec![queue(0, 0), queue(0x4000, 1)];
+        let event = queues[1].eventfd.clone();
+        mem.write_obj(
+            InHeader {
+                len: 56,
+                opcode: Opcode::Init as u32,
+                unique: 77,
+                ..Default::default()
+            },
+            GuestAddress(0x8000),
+        )
+        .unwrap();
+        mem.write_obj(
+            InitIn {
+                major: 7,
+                minor: 31,
+                ..Default::default()
+            },
+            GuestAddress(0x8028),
+        )
+        .unwrap();
+        descriptor(&*mem, 0x4000, 0, 0x8000, 56, 1, 1);
+        descriptor(&*mem, 0x4000, 1, 0x9000, 128, 2, 0);
+        mem.write_obj(0u16, GuestAddress(0x5004)).unwrap();
+        mem.write_obj(1u16, GuestAddress(0x5002)).unwrap();
+        let kvm = Kvm::new().expect("filesystem capture test requires KVM");
+        let config = VirtioDeviceConfig::new(
+            mem.clone(),
+            create_address_space(),
+            Arc::new(kvm.create_vm().unwrap()),
+            DeviceResources::new(),
+            queues,
+            None,
+            Arc::new(NoopNotifier::new()),
+        );
+        let mut fs: VirtioFs<Arc<GuestMemoryMmap>> = VirtioFs::new(
+            TAG,
+            1,
+            16,
+            0,
+            "auto",
+            0,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            new_dummy_handler_helper(),
+            manager.clone(),
+            None,
+            false,
+        )
+        .unwrap();
+        fs.arm_capture(CaptureGeneration(1)).unwrap();
+        fs.activate(config).unwrap();
+        let control = fs.capture_control().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            control
+                .request_hold(CaptureGeneration(1), deadline)
+                .unwrap()
+                .memory_writers,
+            0
+        );
+        event.write(1).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x6002)).unwrap(), 0);
+        control
+            .resume_capture(CaptureGeneration(1), deadline)
+            .unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x6002)).unwrap(), 1);
+        assert_eq!(mem.read_obj::<i32>(GuestAddress(0x9004)).unwrap(), 0);
+        assert_eq!(mem.read_obj::<u64>(GuestAddress(0x9008)).unwrap(), 77);
+        control
+            .request_hold(CaptureGeneration(2), deadline)
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(0x5006)).unwrap();
+        mem.write_obj(2u16, GuestAddress(0x5002)).unwrap();
+        event.write(1).unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x6002)).unwrap(), 1);
+        assert!(control
+            .resume_capture(CaptureGeneration(1), deadline)
+            .is_err());
+        control
+            .resume_capture(CaptureGeneration(2), deadline)
+            .unwrap();
+        manager.handle_events(0).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x6002)).unwrap(), 2);
     }
 }

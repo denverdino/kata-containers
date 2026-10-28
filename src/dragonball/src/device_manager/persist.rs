@@ -134,20 +134,30 @@ pub(crate) fn arm_device_capture(
         .try_state()
         .map_err(|_| VirtioError::InvalidInput)?;
     let inner = state.get_inner_device_mut().as_any_mut();
-    let result = if let Some(block) = inner.downcast_mut::<Block<GuestAddressSpaceImpl>>() {
-        block.arm_capture(generation)
-    } else if let Some(net) = inner.downcast_mut::<Net<GuestAddressSpaceImpl>>() {
-        net.arm_capture(generation)
-    } else {
-        #[cfg(feature = "virtio-balloon")]
-        if let Some(balloon) =
-            inner.downcast_mut::<dbs_virtio_devices::balloon::Balloon<GuestAddressSpaceImpl>>()
-        {
-            return balloon
-                .arm_capture(generation)
-                .map_err(|_| VirtioError::InvalidInput);
-        }
-        return Err(VirtioError::InvalidInput);
-    };
+    let result =
+        if let Some(block) = inner.downcast_mut::<Block<GuestAddressSpaceImpl>>() {
+            block.arm_capture(generation)
+        } else if let Some(net) = inner.downcast_mut::<Net<GuestAddressSpaceImpl>>() {
+            net.arm_capture(generation)
+        } else {
+            #[cfg(feature = "virtio-fs")]
+            if let Some(fs) = inner.downcast_mut::<dbs_virtio_devices::fs::VirtioFs<
+                GuestAddressSpaceImpl,
+                vm_memory::bitmap::AtomicBitmap,
+            >>() {
+                return fs
+                    .arm_capture(generation)
+                    .map_err(|_| VirtioError::InvalidInput);
+            }
+            #[cfg(feature = "virtio-balloon")]
+            if let Some(balloon) =
+                inner.downcast_mut::<dbs_virtio_devices::balloon::Balloon<GuestAddressSpaceImpl>>()
+            {
+                return balloon
+                    .arm_capture(generation)
+                    .map_err(|_| VirtioError::InvalidInput);
+            }
+            return Err(VirtioError::InvalidInput);
+        };
     result.map_err(|_| VirtioError::InvalidInput)
 }

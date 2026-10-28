@@ -19,6 +19,7 @@ use virtio_queue::{QueueOwnedT, QueueT};
 use vm_memory::{GuestAddressSpace, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::capture::CaptureGate;
 use crate::{Error, Result, VirtioDeviceConfig};
 
 use super::{Error as FsError, VIRTIO_FS_NAME};
@@ -175,7 +176,8 @@ pub(crate) struct VirtioFsEpollHandler<
     pub(crate) config: Arc<Mutex<VirtioDeviceConfig<AS, Q, R>>>,
     server: Arc<Server<Arc<Vfs>>>,
     cache_handler: Option<CacheHandler>,
-    thread_pool: Option<ThreadPool>,
+    pub(crate) thread_pool: Option<ThreadPool>,
+    pub(crate) capture: CaptureGate,
     id: String,
     rate_limiter: RateLimiter,
     patch_rate_limiter_fd: EventFd,
@@ -214,6 +216,7 @@ where
             server: Arc::new(Server::new(fs)),
             cache_handler,
             thread_pool,
+            capture: CaptureGate::new(format!("fs:{id}")),
             id,
             rate_limiter,
             patch_rate_limiter_fd,
@@ -222,6 +225,9 @@ where
     }
 
     fn process_queue(&mut self, queue_index: usize) -> Result<()> {
+        if self.capture.is_held() {
+            return Ok(());
+        }
         let mut config_guard = self.config.lock().unwrap();
         let mem = config_guard.lock_guest_memory();
         let vm_as = config_guard.vm_as.clone();

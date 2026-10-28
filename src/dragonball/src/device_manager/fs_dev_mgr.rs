@@ -586,10 +586,8 @@ impl<'a> dbs_snapshot::Persist<'a> for FsDeviceMgr {
 
     /// Capture the state of all virtio-fs devices.
     ///
-    /// The virtual machine must be paused when this is called. Backend
-    /// filesystem state (open handles, inodes, DAX mappings) is not
-    /// captured: snapshots must be taken at a clean quiesce point.
-    /// vhost-user-fs devices are refused.
+    /// vCPUs and inline filesystem dispatch must be held before capture.
+    /// Pooled handlers, DAX, and external vhost-user-fs devices are refused.
     fn save_state(&mut self, _args: ()) -> std::result::Result<Self::State, Self::Error> {
         let mut devices = Vec::new();
         for info in self.info_list.iter() {
@@ -668,7 +666,7 @@ impl<'a> dbs_snapshot::Persist<'a> for FsDeviceMgr {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FsDeviceState {
     /// State of an in-VMM virtio-fs device (`mode = "virtio"`).
-    VirtioFs(virtio::persist::VirtioDeviceInfoState),
+    VirtioFs(virtio::fs::VirtioFsState),
 }
 
 /// Snapshot state of one fs device (config + device state + transport state);

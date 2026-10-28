@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+mod capture;
+pub use self::capture::FsCaptureControl;
 mod handler;
 pub(crate) use self::handler::*;
 mod device;

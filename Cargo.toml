@@ -65,6 +65,7 @@ resolver = "2"
 
 # TODO: Add all excluded crates to root workspace
 exclude = [
+  "src/dragonball/crates/fuse-backend-rs",
   "src/tools",
 
   # We are cloning and building rust packages under
@@ -272,3 +273,6 @@ which = "4.3.0"
 [profile.release.package."kata-deploy"]
 codegen-units = 1
 opt-level = "z"
+
+[patch.crates-io]
+fuse-backend-rs = { path = "src/dragonball/crates/fuse-backend-rs" }
