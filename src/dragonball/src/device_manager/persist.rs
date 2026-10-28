@@ -139,6 +139,14 @@ pub(crate) fn arm_device_capture(
     } else if let Some(net) = inner.downcast_mut::<Net<GuestAddressSpaceImpl>>() {
         net.arm_capture(generation)
     } else {
+        #[cfg(feature = "virtio-vsock")]
+        if let Some(vsock) =
+            inner.downcast_mut::<dbs_virtio_devices::vsock::Vsock<GuestAddressSpaceImpl>>()
+        {
+            return vsock
+                .arm_capture(generation)
+                .map_err(|_| VirtioError::InvalidInput);
+        }
         #[cfg(feature = "virtio-balloon")]
         if let Some(balloon) =
             inner.downcast_mut::<dbs_virtio_devices::balloon::Balloon<GuestAddressSpaceImpl>>()
