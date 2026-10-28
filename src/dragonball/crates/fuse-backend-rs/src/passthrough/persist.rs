@@ -99,10 +99,7 @@ fn find_reference(root: &File, wanted: InodeId) -> io::Result<Option<Vec<u8>>> {
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Reject configurations whose backend state cannot be reconstructed.
     pub fn validate_snapshot(&self) -> io::Result<()> {
-        if self.cfg.use_host_ino
-            || self.cfg.inode_file_handles
-            || self.cfg.dax_file_size.is_some()
-            || self.perfile_dax.load(Ordering::Acquire)
+        if self.cfg.use_host_ino || self.cfg.inode_file_handles || self.cfg.dax_file_size.is_some()
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -216,7 +213,6 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     pub fn restore_state(&self, state: &PassthroughState) -> io::Result<()> {
         self.validate_snapshot()?;
         if state.version != 1
-            || state.options[6]
             || state.next_inode <= fuse::ROOT_ID
             || state.next_handle == 0
             || state.next_inode > VFS_MAX_INO
@@ -395,6 +391,10 @@ mod tests {
         let original = TempDir::new().unwrap();
         std::fs::write(original.as_path().join("file"), b"before:payload").unwrap();
         let fs = filesystem(original.as_path());
+        assert!(fs
+            .init(FsOptions::PERFILE_DAX)
+            .unwrap()
+            .contains(FsOptions::PERFILE_DAX));
         let ctx = Context::default();
         let entry = fs.lookup(&ctx, 1, &CString::new("file").unwrap()).unwrap();
         let handle = fs
