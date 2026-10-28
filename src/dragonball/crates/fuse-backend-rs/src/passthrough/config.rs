@@ -99,6 +99,10 @@ pub struct Config {
     /// The default is `/`.
     pub root_dir: String,
 
+    /// Share-relative subtrees whose files are not reconstructed from the snapshot.
+    /// Retained file references must identify the same host object after restore.
+    pub preserve_file_identity: Vec<std::path::PathBuf>,
+
     /// Whether the file system should support Extended Attributes (xattr). Enabling this feature may
     /// have a significant impact on performance, especially on write parallelism. This is the result
     /// of FUSE attempting to remove the special file privileges after each write request.
@@ -191,6 +195,7 @@ impl Default for Config {
             cache_policy: Default::default(),
             writeback: false,
             root_dir: String::from("/"),
+            preserve_file_identity: Vec::new(),
             xattr: false,
             do_import: true,
             no_open: false,

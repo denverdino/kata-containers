@@ -175,6 +175,16 @@ extern "C" {
 }
 
 impl FileHandle {
+    pub(crate) fn identity(&self) -> (i32, Vec<u8>) {
+        let handle = self.handle.wrapper.as_fam_struct_ref();
+        // The wrapper owns exactly handle_bytes initialized bytes.
+        let bytes = unsafe { handle.f_handle.as_slice(handle.handle_bytes as usize) };
+        (
+            handle.handle_type,
+            bytes.iter().map(|byte| *byte as u8).collect(),
+        )
+    }
+
     /// Create a file handle for the given file.
     ///
     /// Return `Ok(None)` if no file handle can be generated for this file: Either because the

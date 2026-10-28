@@ -6,12 +6,13 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// Guest-visible references and negotiated options for a quiesced filesystem.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PassthroughState {
     version: u32,
+    preserve_file_identity: Vec<PathBuf>,
     next_inode: u64,
     next_handle: u64,
     inodes: Vec<InodeState>,
@@ -25,6 +26,7 @@ struct InodeState {
     path: Option<Vec<u8>>,
     refcount: u64,
     mode: u32,
+    identity: Option<FileIdentity>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,6 +34,73 @@ struct HandleState {
     handle: u64,
     inode: u64,
     flags: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    generation: FileGeneration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum FileGeneration {
+    Handle(i32, Vec<u8>),
+    BirthTime(i64, u32),
+}
+
+impl FileIdentity {
+    fn read(file: &impl AsRawFd) -> io::Result<Self> {
+        let stat = statx::statx(file, None)?;
+        let empty = CString::new("").unwrap();
+        let generation = if let Some(handle) = FileHandle::from_name_at(file, &empty)? {
+            let (kind, bytes) = handle.identity();
+            FileGeneration::Handle(kind, bytes)
+        } else {
+            let mut birth = std::mem::MaybeUninit::<super::os_compat::statx_st>::zeroed();
+            // The kernel writes the owned buffer; fields are read only after success.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_statx,
+                    file.as_raw_fd(),
+                    empty.as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                    libc::STATX_BTIME,
+                    birth.as_mut_ptr(),
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let birth = unsafe { birth.assume_init() };
+            if birth.stx_mask & libc::STATX_BTIME == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "preserved files require a kernel file handle or birth time",
+                ));
+            }
+            FileGeneration::BirthTime(birth.stx_btime.tv_sec, birth.stx_btime.tv_nsec)
+        };
+        Ok(Self {
+            device: stat.st.st_dev,
+            inode: stat.st.st_ino,
+            generation,
+        })
+    }
+
+    fn matches(&self, file: &File, stat: &statx::StatExt) -> io::Result<bool> {
+        if self.device != stat.st.st_dev || self.inode != stat.st.st_ino {
+            return Ok(false);
+        }
+        Ok(*self == Self::read(file)?)
+    }
+}
+
+fn preserves_file(scopes: &[PathBuf], path: &[u8], mode: u32) -> bool {
+    mode & libc::S_IFMT != libc::S_IFDIR
+        && scopes
+            .iter()
+            .any(|scope| Path::new(std::ffi::OsStr::from_bytes(path)).starts_with(scope))
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -58,7 +127,10 @@ fn open_relative(root: &File, path: &[u8]) -> io::Result<File> {
     Ok(file)
 }
 
-fn find_reference(root: &File, wanted: InodeId) -> io::Result<Option<Vec<u8>>> {
+fn find_reference(
+    root: &File,
+    matches: impl Fn(&File, &statx::StatExt) -> io::Result<bool>,
+) -> io::Result<Option<Vec<u8>>> {
     let mut pending = vec![(root.try_clone()?, Vec::new())];
     let mut visited = BTreeSet::new();
     while let Some((directory, prefix)) = pending.pop() {
@@ -85,7 +157,7 @@ fn find_reference(root: &File, wanted: InodeId) -> io::Result<Option<Vec<u8>>> {
                 path.push(b'/');
             }
             path.extend_from_slice(name.as_bytes());
-            if InodeId::from_stat(&stat) == wanted {
+            if matches(&file, &stat)? {
                 return Ok(Some(path));
             }
             if stat.st.st_mode & libc::S_IFMT == libc::S_IFDIR {
@@ -105,6 +177,24 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 io::ErrorKind::Unsupported,
                 "snapshot requires virtual inode IDs, path-backed inodes, and disabled DAX",
             ));
+        }
+        let mut scopes = BTreeSet::new();
+        for scope in &self.cfg.preserve_file_identity {
+            if scope.as_os_str().is_empty()
+                || !scope
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                || scope
+                    .as_os_str()
+                    .as_bytes()
+                    .split(|byte| *byte == b'/')
+                    .any(|part| part.is_empty() || part == b"." || part == b"..")
+                || !scopes.insert(scope)
+            {
+                return Err(invalid(
+                    "preserved file scope must be a distinct normalized relative path",
+                ));
+            }
         }
         Ok(())
     }
@@ -154,15 +244,22 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 && !matches!(data.handle, InodeHandle::Missing)
                 && data.handle.stat()?.st_nlink != 0
             {
-                find_reference(&root, data.id)?
+                find_reference(&root, |_, stat| Ok(InodeId::from_stat(stat) == data.id))?
             } else {
                 path
+            };
+            let identity = match path.as_ref() {
+                Some(path) if preserves_file(&self.cfg.preserve_file_identity, path, data.mode) => {
+                    Some(FileIdentity::read(&data.get_file()?)?)
+                }
+                _ => None,
             };
             inodes.push(InodeState {
                 inode: data.inode,
                 path,
                 refcount: data.refcount.load(Ordering::Acquire),
                 mode: data.mode,
+                identity,
             });
         }
         let handles = self.handle_map.handles.read().unwrap();
@@ -191,7 +288,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             });
         }
         Ok(PassthroughState {
-            version: 1,
+            version: 2,
+            preserve_file_identity: self.cfg.preserve_file_identity.clone(),
             next_inode: self.next_inode.load(Ordering::Acquire),
             next_handle: self.next_handle.load(Ordering::Acquire),
             inodes,
@@ -212,7 +310,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
     /// Host inode numbers may differ after extracting the saved filesystem tree.
     pub fn restore_state(&self, state: &PassthroughState) -> io::Result<()> {
         self.validate_snapshot()?;
-        if state.version != 1
+        if state.version != 2
+            || state.preserve_file_identity != self.cfg.preserve_file_identity
             || state.next_inode <= fuse::ROOT_ID
             || state.next_handle == 0
             || state.next_inode > VFS_MAX_INO
@@ -234,22 +333,54 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             if entry.inode == fuse::ROOT_ID && entry.path.as_deref() != Some(&[]) {
                 return Err(invalid("snapshot root is missing"));
             }
-            let reopened = entry
+            let requires_identity = entry.path.as_ref().is_some_and(|path| {
+                preserves_file(&self.cfg.preserve_file_identity, path, entry.mode)
+            });
+            if requires_identity != entry.identity.is_some() {
+                return Err(invalid("snapshot file identity does not match its scope"));
+            }
+            let mut reopened = entry
                 .path
                 .as_ref()
                 .map(|path| open_relative(&root, path))
                 .transpose();
+            if let Some(identity) = &entry.identity {
+                let matches = match &reopened {
+                    Ok(Some(file)) => identity.matches(file, &statx::statx(file, None)?)?,
+                    Ok(None) => false,
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) =>
+                    {
+                        false
+                    }
+                    Err(_) => return Err(reopened.err().unwrap()),
+                };
+                if !matches {
+                    reopened = find_reference(&root, |file, stat| identity.matches(file, stat))?
+                        .map(|path| open_relative(&root, &path))
+                        .transpose();
+                }
+            }
             let (handle, id, mode) = match reopened {
                 Ok(Some(file)) => {
                     let stat = statx::statx(&file, None)?;
-                    if stat.st.st_mode & libc::S_IFMT != entry.mode & libc::S_IFMT {
-                        return Err(invalid("snapshot inode changed file type"));
+                    // A live tree may change between finding a path and opening it.
+                    let matches = match &entry.identity {
+                        Some(identity) => identity.matches(&file, &stat)?,
+                        None => true,
+                    };
+                    if !matches {
+                        (InodeHandle::Missing, InodeId::default(), entry.mode)
+                    } else {
+                        if stat.st.st_mode & libc::S_IFMT != entry.mode & libc::S_IFMT {
+                            return Err(invalid("snapshot inode changed file type"));
+                        }
+                        let id = InodeId::from_stat(&stat);
+                        if !host_ids.insert(id) {
+                            return Err(invalid("snapshot inodes alias one host file"));
+                        }
+                        (InodeHandle::File(file), id, stat.st.st_mode)
                     }
-                    let id = InodeId::from_stat(&stat);
-                    if !host_ids.insert(id) {
-                        return Err(invalid("snapshot inodes alias one host file"));
-                    }
-                    (InodeHandle::File(file), id, stat.st.st_mode)
                 }
                 Ok(None) => (InodeHandle::Missing, InodeId::default(), entry.mode),
                 Err(e)
@@ -340,6 +471,7 @@ mod tests {
     use crate::file_traits::FileReadWriteVolatile;
     use std::ffi::CString;
     use std::io::{self, Write};
+    use std::path::PathBuf;
     use vmm_sys_util::tempdir::TempDir;
 
     #[derive(Default)]
@@ -375,7 +507,12 @@ mod tests {
     }
 
     fn filesystem(root: &std::path::Path) -> PassthroughFs<()> {
+        scoped_filesystem(root, Vec::new())
+    }
+
+    fn scoped_filesystem(root: &std::path::Path, scopes: Vec<PathBuf>) -> PassthroughFs<()> {
         let fs = PassthroughFs::new(Config {
+            preserve_file_identity: scopes,
             root_dir: root.to_str().unwrap().into(),
             xattr: true,
             ..Default::default()
@@ -384,6 +521,116 @@ mod tests {
         fs.import().unwrap();
         fs.init(FsOptions::empty()).unwrap();
         fs
+    }
+
+    #[test]
+    fn restored_live_handles_keep_object_identity() {
+        for change in ["replace", "same-content", "write", "rename", "adjacent"] {
+            let root = TempDir::new().unwrap();
+            let directory = if change == "adjacent" {
+                "live-other"
+            } else {
+                "live"
+            };
+            std::fs::create_dir(root.as_path().join(directory)).unwrap();
+            let path = root.as_path().join(directory).join("file");
+            std::fs::write(&path, b"original").unwrap();
+            let scopes = vec![PathBuf::from("live")];
+            let fs = scoped_filesystem(root.as_path(), scopes.clone());
+            let ctx = Context::default();
+            let parent = fs
+                .lookup(&ctx, 1, &CString::new(directory).unwrap())
+                .unwrap()
+                .inode;
+            let inode = fs
+                .lookup(&ctx, parent, &CString::new("file").unwrap())
+                .unwrap()
+                .inode;
+            let handle = fs
+                .open(&ctx, inode, libc::O_RDONLY as u32, 0)
+                .unwrap()
+                .0
+                .unwrap();
+            let state = fs.save_state().unwrap();
+            drop(fs);
+            if change == "write" {
+                std::fs::write(&path, b"updated!").unwrap();
+            } else {
+                if change == "rename" {
+                    std::fs::hard_link(&path, path.with_file_name("alias")).unwrap();
+                }
+                let contents: &[u8] = if change == "same-content" {
+                    b"original"
+                } else {
+                    b"replaced"
+                };
+                std::fs::write(path.with_file_name("new"), contents).unwrap();
+                std::fs::rename(path.with_file_name("new"), &path).unwrap();
+            }
+            let restored = scoped_filesystem(root.as_path(), scopes);
+            let mut omitted = state.clone();
+            omitted.preserve_file_identity.clear();
+            assert!(restored.restore_state(&omitted).is_err());
+            if change != "adjacent" {
+                let mut omitted = state.clone();
+                omitted
+                    .inodes
+                    .iter_mut()
+                    .find(|entry| entry.inode == inode)
+                    .unwrap()
+                    .identity = None;
+                assert!(restored.restore_state(&omitted).is_err());
+            }
+            restored.restore_state(&state).unwrap();
+            let mut output = Output::default();
+            let result = restored.read(&ctx, inode, handle, &mut output, 8, 0, None, 0);
+            match change {
+                "replace" | "same-content" => {
+                    assert_eq!(
+                        result.unwrap_err().raw_os_error(),
+                        Some(libc::EIO),
+                        "{change}"
+                    );
+                    assert!(output.0.is_empty());
+                    let new_inode = restored
+                        .lookup(&ctx, parent, &CString::new("file").unwrap())
+                        .unwrap()
+                        .inode;
+                    assert_ne!(new_inode, inode);
+                }
+                _ => {
+                    result.unwrap();
+                    let expected: &[u8] = match change {
+                        "write" => b"updated!",
+                        "rename" => b"original",
+                        _ => b"replaced",
+                    };
+                    assert_eq!(output.0, expected, "{change}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preserved_scopes_reject_ambiguous_paths() {
+        let root = TempDir::new().unwrap();
+        for scope in [
+            "",
+            "/live",
+            "../live",
+            "live/../other",
+            "live/",
+            "live//child",
+            "./live",
+        ] {
+            let fs = scoped_filesystem(root.as_path(), vec![PathBuf::from(scope)]);
+            assert!(fs.save_state().is_err(), "{scope}");
+        }
+        let fs = scoped_filesystem(
+            root.as_path(),
+            vec![PathBuf::from("live"), PathBuf::from("live")],
+        );
+        assert!(fs.save_state().is_err());
     }
 
     #[test]

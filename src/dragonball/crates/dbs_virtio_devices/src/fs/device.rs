@@ -377,7 +377,7 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
                         self.mount_blobfs(source, mountpoint, config, dax_threshold_size_kb)
                     }
                     Some("PassthroughFs") | Some(PASSTHROUGHFS) => {
-                        self.mount_passthroughfs(source, mountpoint, dax_threshold_size_kb)
+                        self.mount_passthroughfs(source, mountpoint, config, dax_threshold_size_kb)
                     }
                     Some("Rafs") | Some(RAFS) => {
                         self.mount_rafs(source, mountpoint, config, prefetch_list_path)
@@ -461,6 +461,7 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
     fn new_passthroughfs(
         &mut self,
         source: String,
+        config: &str,
         dax_threshold_size_kb: Option<u64>,
     ) -> FsResult<PassthroughFs<()>> {
         debug!("http_server passthrough");
@@ -471,8 +472,14 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
             None => None,
         };
 
+        let config: PassthroughMountConfig = if config.is_empty() {
+            PassthroughMountConfig::default()
+        } else {
+            serde_json::from_str(config).map_err(|_| FsError::InvalidData)?
+        };
         let fs_cfg = PassthroughConfig {
             root_dir: source,
+            preserve_file_identity: config.preserve_file_identity,
             do_import: false,
             writeback: self.writeback_cache,
             no_open: self.no_open,
@@ -497,9 +504,12 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
         &mut self,
         source: String,
         mountpoint: &str,
+        config: Option<String>,
         dax_threshold_size_kb: Option<u64>,
     ) -> FsResult<()> {
-        let passthrough_fs = self.new_passthroughfs(source.clone(), dax_threshold_size_kb)?;
+        let config = config.unwrap_or_default();
+        let passthrough_fs =
+            self.new_passthroughfs(source.clone(), &config, dax_threshold_size_kb)?;
         let fs = Box::new(passthrough_fs);
         match self.fs.mount(fs, mountpoint) {
             Ok(idx) => {
@@ -508,7 +518,7 @@ impl<AS: GuestAddressSpace, B: NewBitmap> VirtioFs<AS, B> {
                     BackendFsInfo {
                         index: idx,
                         fstype: PASSTHROUGHFS.to_string(),
-                        src_cfg: Some((source, String::new())),
+                        src_cfg: Some((source, config)),
                     },
                 );
                 Ok(())
@@ -800,6 +810,12 @@ fn set_default_rlimit_nofile() -> Result<()> {
     }
 }
 
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PassthroughMountConfig {
+    preserve_file_identity: Vec<std::path::PathBuf>,
+}
+
 /// Inline filesystem state, including guest references into each backend.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VirtioFsState {
@@ -816,6 +832,8 @@ pub struct VirtioFsState {
 pub struct PassthroughMountState {
     /// Trusted host share path, validated by the snapshot consumer.
     pub source: String,
+    /// Backend policy supplied when the filesystem was mounted.
+    pub config: String,
     /// Guest Vfs mount point.
     pub mountpoint: String,
     /// Guest-visible backend index.
@@ -850,6 +868,7 @@ impl<'a, AS: GuestAddressSpace, B: NewBitmap> crate::persist::VirtioDevicePersis
                 .ok_or(Error::InvalidInput)?;
             backends.push(PassthroughMountState {
                 source: info.src_cfg.as_ref().ok_or(Error::InvalidInput)?.0.clone(),
+                config: info.src_cfg.as_ref().ok_or(Error::InvalidInput)?.1.clone(),
                 mountpoint: mountpoint.clone(),
                 index: info.index,
                 state: backend.save_state().map_err(Error::IOError)?,
@@ -884,7 +903,7 @@ impl<'a, AS: GuestAddressSpace, B: NewBitmap> crate::persist::VirtioDevicePersis
                 return Err(Error::InvalidInput);
             }
             let fs = self
-                .new_passthroughfs(backend.source.clone(), None)
+                .new_passthroughfs(backend.source.clone(), &backend.config, None)
                 .map_err(|_| Error::InvalidInput)?;
             fs.restore_state(&backend.state).map_err(Error::IOError)?;
             vfs.restore_mount(Box::new(fs), backend.index, &backend.mountpoint)
@@ -894,7 +913,7 @@ impl<'a, AS: GuestAddressSpace, B: NewBitmap> crate::persist::VirtioDevicePersis
                 BackendFsInfo {
                     index: backend.index,
                     fstype: PASSTHROUGHFS.into(),
-                    src_cfg: Some((backend.source.clone(), String::new())),
+                    src_cfg: Some((backend.source.clone(), backend.config.clone())),
                 },
             );
         }
