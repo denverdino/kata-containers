@@ -486,7 +486,7 @@ impl<AS: GuestAddressSpace> Pmem<AS> {
         }
         let mapping =
             MmapRegion::build(None, len as usize, prot, flags).map_err(Error::NewMmapRegion)?;
-        if mapping.as_ptr() as usize % page_size as usize != 0 {
+        if !(mapping.as_ptr() as usize).is_multiple_of(page_size as usize) {
             return Err(Error::InvalidInput);
         }
         // SAFETY: replace only the file prefix inside this owned reservation.
@@ -1053,8 +1053,12 @@ mod tests {
             device_config(vm_fd),
         )
         .unwrap();
+        let retained = dev.region.clone().unwrap();
+        assert!(retained.owned());
         drop(dev);
         assert!(removed.load(Ordering::SeqCst));
+        // SAFETY: the retained region still owns its complete mapping.
+        assert_eq!(unsafe { retained.as_ptr().read_volatile() }, 0);
     }
 
     #[test]

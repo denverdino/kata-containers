@@ -111,6 +111,7 @@ impl PmemDeviceMgr {
             "id" => &config.id,
         );
         self.info_list.insert_or_update(&config)?;
+        self.restore_bindings.clear();
         Ok(())
     }
 
@@ -208,20 +209,24 @@ impl<'a> dbs_snapshot::Persist<'a> for PmemDeviceMgr {
 }
 
 impl PmemDeviceMgr {
-    pub(crate) fn bind_restore(
+    pub(crate) fn set_restore_bindings(
         &mut self,
-        binding: &RestorePmemBinding,
+        bindings: &[RestorePmemBinding],
     ) -> Result<(), PmemDeviceError> {
-        if self.restore_bindings.iter().any(|old| old.id == binding.id)
-            || !self
-                .info_list
-                .iter()
-                .any(|info| info.config.id == binding.id && info.config.read_only)
-            || binding.saved_backing.2 != binding.current_backing.2
-        {
-            return Err(virtio::Error::InvalidInput.into());
+        self.restore_bindings.clear();
+        let mut ids = std::collections::HashSet::new();
+        for binding in bindings {
+            if !ids.insert(&binding.id)
+                || !self
+                    .info_list
+                    .iter()
+                    .any(|info| info.config.id == binding.id && info.config.read_only)
+                || binding.saved_backing.2 != binding.current_backing.2
+            {
+                return Err(virtio::Error::InvalidInput.into());
+            }
         }
-        self.restore_bindings.push(binding.clone());
+        self.restore_bindings = bindings.to_vec();
         Ok(())
     }
 

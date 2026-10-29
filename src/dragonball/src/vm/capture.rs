@@ -471,12 +471,10 @@ impl Vm {
                 .map_err(|e| CaptureError::Rejected(e.to_string()))?;
         }
         #[cfg(feature = "virtio-pmem")]
-        for binding in &files.pmem_bindings {
-            self.device_manager
-                .pmem_manager
-                .bind_restore(binding)
-                .map_err(|e| CaptureError::Rejected(e.to_string()))?;
-        }
+        self.device_manager
+            .pmem_manager
+            .set_restore_bindings(&files.pmem_bindings)
+            .map_err(|e| CaptureError::Rejected(e.to_string()))?;
         self.device_manager
             .validate_capture_profile()
             .map_err(|e| CaptureError::Rejected(e.to_string()))?;
@@ -1253,6 +1251,15 @@ mod tests {
             };
             let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", alias.as_raw_fd()));
             configure_pmem(target, &path);
+            if index == 1 {
+                let invalid = TempFile::new().unwrap();
+                invalid.as_file().write_all_at(b"{}", 0).unwrap();
+                let mut rejected = files(&invalid, &ram_file);
+                rejected.pmem_bindings = input.pmem_bindings.clone();
+                assert!(target
+                    .load_snapshot_held(&mut events, Default::default(), &rejected, 1, deadline())
+                    .is_err());
+            }
             target
                 .load_snapshot_held(&mut events, Default::default(), &input, 1, deadline())
                 .unwrap();
