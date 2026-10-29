@@ -39,6 +39,9 @@ pub struct SnapshotFiles {
     pub memory: Arc<File>,
     /// Checked replacements for explicitly reserved slots; never serialized into VM state.
     pub block_bindings: Vec<crate::device_manager::blk_dev_mgr::RestoreBlockBinding>,
+    /// Authenticated, read-only PMEM replacements; never serialized into VM state.
+    #[cfg(feature = "virtio-pmem")]
+    pub pmem_bindings: Vec<crate::device_manager::pmem_dev_mgr::RestorePmemBinding>,
 }
 
 impl SnapshotFiles {
@@ -48,12 +51,18 @@ impl SnapshotFiles {
             state: Arc::new(state),
             memory: Arc::new(memory),
             block_bindings: Vec::new(),
+            #[cfg(feature = "virtio-pmem")]
+            pmem_bindings: Vec::new(),
         }
     }
 }
 
 impl PartialEq for SnapshotFiles {
     fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "virtio-pmem")]
+        if self.pmem_bindings != other.pmem_bindings {
+            return false;
+        }
         Arc::ptr_eq(&self.state, &other.state)
             && Arc::ptr_eq(&self.memory, &other.memory)
             && self.block_bindings == other.block_bindings

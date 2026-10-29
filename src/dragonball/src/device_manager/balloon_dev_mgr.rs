@@ -257,6 +257,8 @@ impl BalloonDeviceMgr {
                         format!("balloon:{}", info.config.balloon_id),
                         Arc::new(crate::address_space_manager::PrivateMemoryReclaimer::new(
                             ctx.get_vm_as().map_err(BalloonDeviceError::DeviceManager)?,
+                            ctx.get_address_space()
+                                .map_err(BalloonDeviceError::DeviceManager)?,
                         )),
                     )
                     .map_err(BalloonDeviceError::CreateBalloonDevice)?;

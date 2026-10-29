@@ -59,6 +59,8 @@ fn validate_acks(
 }
 
 enum CaptureControl {
+    #[cfg(feature = "virtio-pmem")]
+    Pmem(dbs_virtio_devices::pmem::PmemCaptureControl),
     Block(WorkerCaptureControl),
     Net(NetCaptureControl),
     #[cfg(feature = "virtio-fs")]
@@ -84,6 +86,8 @@ pub(super) struct DeviceCaptureSession {
 impl CaptureTarget {
     fn hold(&self, generation: CaptureGeneration, deadline: Instant) -> CaptureResult<WorkerAck> {
         match &self.control {
+            #[cfg(feature = "virtio-pmem")]
+            CaptureControl::Pmem(control) => control.request_hold(generation, deadline),
             CaptureControl::Block(control) => control.request_hold(generation, deadline),
             CaptureControl::Net(control) => control.request_hold(generation, deadline),
             #[cfg(feature = "virtio-fs")]
@@ -97,6 +101,8 @@ impl CaptureTarget {
 
     fn resume(&self, generation: CaptureGeneration, deadline: Instant) -> CaptureResult<()> {
         match &self.control {
+            #[cfg(feature = "virtio-pmem")]
+            CaptureControl::Pmem(control) => control.resume_capture(generation, deadline),
             CaptureControl::Block(control) => control.resume(generation, deadline),
             CaptureControl::Net(control) => control.resume_capture(generation, deadline),
             #[cfg(feature = "virtio-fs")]
@@ -184,6 +190,16 @@ impl DeviceManager {
 
     /// Arm all fresh MMIO devices before any activation is replayed.
     pub(crate) fn arm_capture_restore(&mut self, generation: CaptureGeneration) -> Result<()> {
+        #[cfg(feature = "virtio-pmem")]
+        for info in self.pmem_manager.info_list.iter() {
+            super::persist::arm_device_capture(
+                info.device
+                    .as_ref()
+                    .ok_or_else(|| DeviceCaptureError::Rejected("unattached pmem".into()))?,
+                generation,
+            )
+            .map_err(|e| DeviceCaptureError::Rejected(e.to_string()))?;
+        }
         #[cfg(feature = "virtio-vsock")]
         for info in self.vsock_manager.info_list.iter() {
             let device = info
@@ -342,6 +358,28 @@ impl DeviceManager {
                 id: format!("vsock:{}", info.config.id),
                 flush_required: false,
                 control: CaptureControl::Vsock(control),
+            });
+        }
+        #[cfg(feature = "virtio-pmem")]
+        for info in self.pmem_manager.info_list.iter() {
+            if !info.config.read_only {
+                return Err(DeviceCaptureError::Rejected(
+                    "writable pmem cannot be captured".into(),
+                ));
+            }
+            let device = info
+                .device
+                .as_ref()
+                .ok_or_else(|| DeviceCaptureError::Rejected("unattached pmem".into()))?;
+            let control = device_control::<dbs_virtio_devices::pmem::Pmem<GuestAddressSpaceImpl>, _>(
+                device,
+                deadline,
+                |inner| inner.capture_control(),
+            )?;
+            targets.push(CaptureTarget {
+                id: format!("pmem:{}", info.config.id),
+                flush_required: false,
+                control: CaptureControl::Pmem(control),
             });
         }
         #[cfg(feature = "virtio-balloon")]

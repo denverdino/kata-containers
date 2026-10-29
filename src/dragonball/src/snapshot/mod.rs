@@ -51,6 +51,10 @@ pub use dbs_snapshot::{check_epoch, PersistError};
 /// not implemented yet is simply absent (`None`).
 #[derive(Default, Deserialize, Serialize)]
 pub struct DeviceManagerState {
+    /// Read-only PMEM device and transport state.
+    #[cfg(feature = "virtio-pmem")]
+    #[serde(default)]
+    pub pmem: Option<crate::device_manager::pmem_dev_mgr::PmemDeviceMgrState>,
     /// State of the block device manager.
     #[cfg(feature = "virtio-blk")]
     #[serde(default)]
@@ -87,6 +91,10 @@ pub const FORMAT_EPOCH: u16 = 1;
 /// Errors from the top-level microVM save/restore orchestration.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
+    /// PMEM state or mapping mismatch.
+    #[cfg(feature = "virtio-pmem")]
+    #[error("pmem snapshot error: {0}")]
+    Pmem(#[from] crate::device_manager::pmem_dev_mgr::PmemDeviceError),
     /// Snapshot operations require a running or paused VM.
     #[error("invalid VM state for snapshot: {0}")]
     InvalidState(String),

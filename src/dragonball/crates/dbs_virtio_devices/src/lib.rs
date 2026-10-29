@@ -51,6 +51,9 @@ pub mod block;
 #[cfg(feature = "virtio-fs")]
 pub mod fs;
 
+#[cfg(feature = "virtio-pmem")]
+pub mod pmem;
+
 #[cfg(feature = "virtio-mem")]
 pub mod mem;
 

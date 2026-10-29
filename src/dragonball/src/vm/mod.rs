@@ -1202,6 +1202,12 @@ impl Vm {
             ));
         }
 
+        #[cfg(feature = "virtio-pmem")]
+        if !self.device_manager.pmem_manager.is_empty() {
+            return Err(SnapshotError::InvalidState(
+                "pmem requires held snapshot capture".into(),
+            ));
+        }
         let msr_list = self.kvm.supported_msrs(0).map_err(SnapshotError::Kvm)?;
 
         let initial_state = self.instance_state();
@@ -1262,6 +1268,7 @@ impl Vm {
         reset_vsock_transport: bool,
     ) -> std::result::Result<(), crate::snapshot::SnapshotError> {
         use dbs_snapshot::Persist;
+
         let vcpu_states = self.vcpu_manager()?.save_state(msr_list)?;
         let mut state = self.snapshot_metadata_paused(vcpu_states, reset_vsock_transport)?;
         let mut mem_file = std::fs::File::create(mem_path)?;
@@ -1281,6 +1288,7 @@ impl Vm {
             feature = "virtio-blk",
             feature = "virtio-net",
             feature = "virtio-balloon",
+            feature = "virtio-pmem",
             feature = "virtio-vsock",
             feature = "virtio-fs",
             feature = "vhost-user-fs"
@@ -1325,6 +1333,10 @@ impl Vm {
 
         #[allow(unused_mut)]
         let mut device_states = DeviceManagerState::default();
+        #[cfg(feature = "virtio-pmem")]
+        {
+            device_states.pmem = Some(self.device_manager.pmem_manager.save_state(())?);
+        }
         #[cfg(feature = "virtio-blk")]
         {
             device_states.block = Some(self.device_manager.block_manager.save_state(())?);
@@ -1393,8 +1405,25 @@ impl Vm {
         use crate::snapshot::MicrovmState;
         use dbs_snapshot::Persist;
 
+        #[cfg(feature = "virtio-pmem")]
+        if !self.device_manager.pmem_manager.is_empty() {
+            return Err(crate::snapshot::SnapshotError::InvalidState(
+                "pmem requires held restore".into(),
+            ));
+        }
         let state = MicrovmState::load_from_file(state_path)?;
         state.validate_for_restore(self.vm_config.vcpu_count)?;
+        #[cfg(feature = "virtio-pmem")]
+        if state
+            .device_states
+            .pmem
+            .as_ref()
+            .is_some_and(|state| !state.devices.is_empty())
+        {
+            return Err(crate::snapshot::SnapshotError::InvalidState(
+                "pmem requires held restore".into(),
+            ));
+        }
         #[cfg(feature = "virtio-balloon")]
         if !self.device_manager.balloon_manager.info_list.is_empty()
             || state

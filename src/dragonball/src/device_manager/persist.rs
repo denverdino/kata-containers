@@ -157,6 +157,14 @@ pub(crate) fn arm_device_capture(
                     .arm_capture(generation)
                     .map_err(|_| VirtioError::InvalidInput);
             }
+            #[cfg(feature = "virtio-pmem")]
+            if let Some(pmem) =
+                inner.downcast_mut::<dbs_virtio_devices::pmem::Pmem<GuestAddressSpaceImpl>>()
+            {
+                return pmem
+                    .arm_capture(generation)
+                    .map_err(|_| VirtioError::InvalidInput);
+            }
             #[cfg(feature = "virtio-balloon")]
             if let Some(balloon) =
                 inner.downcast_mut::<dbs_virtio_devices::balloon::Balloon<GuestAddressSpaceImpl>>()

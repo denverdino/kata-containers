@@ -76,7 +76,8 @@ pub type GuestRegionImpl = GuestRegionMmap;
 /// The region FileOffset describes the ancestor, not these overridden pages.
 #[cfg(feature = "virtio-balloon")]
 pub struct PrivateMemoryReclaimer {
-    memory: GuestAddressSpaceImpl,
+    memory: GuestMemoryImpl,
+    ram_ranges: Vec<(u64, u64)>,
     anonymous_ranges: Mutex<Vec<(u64, u64)>>,
 }
 
@@ -90,9 +91,16 @@ impl dbs_virtio_devices::balloon::BalloonReclaimer for PrivateMemoryReclaimer {
 #[cfg(feature = "virtio-balloon")]
 impl PrivateMemoryReclaimer {
     /// Retain the real mapping owners for every device reclamation callback.
-    pub fn new(memory: GuestAddressSpaceImpl) -> Self {
+    pub fn new(memory: GuestAddressSpaceImpl, address_space: AddressSpace) -> Self {
+        let memory = (*memory.memory()).clone();
+        let ram_ranges = memory
+            .iter()
+            .filter(|region| !address_space.is_dax_region(region.start_addr()))
+            .map(|region| (region.start_addr().0, region.len()))
+            .collect();
         Self {
             memory,
+            ram_ranges,
             anonymous_ranges: Mutex::new(Vec::new()),
         }
     }
@@ -104,12 +112,24 @@ impl PrivateMemoryReclaimer {
         let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
         let end = guest_addr.checked_add(length).ok_or_else(invalid)?;
         let length_usize = usize::try_from(length).map_err(|_| invalid())?;
-        let memory = self.memory.memory();
+        let memory = &self.memory;
         if length == 0
             || !guest_addr.is_multiple_of(4096)
             || !length.is_multiple_of(4096)
             || unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != 4096
             || !memory.check_range(GuestAddress(guest_addr), length_usize)
+        {
+            return Err(invalid());
+        }
+        if !memory
+            .iter()
+            .filter(|region| {
+                guest_addr < region.start_addr().0 + region.len() && end > region.start_addr().0
+            })
+            .all(|region| {
+                self.ram_ranges
+                    .contains(&(region.start_addr().0, region.len()))
+            })
         {
             return Err(invalid());
         }
@@ -141,6 +161,30 @@ impl PrivateMemoryReclaimer {
             .lock()
             .map_err(|_| std::io::Error::other("RAM owner poisoned"))?;
         for (region, start, stop, offset, host) in segments {
+            if region.flags() & libc::MAP_SHARED != 0 {
+                let backing = region.file_offset().ok_or_else(invalid)?;
+                let file_offset = backing.start().checked_add(offset).ok_or_else(invalid)?;
+                let file_offset = libc::off_t::try_from(file_offset).map_err(|_| invalid())?;
+                let bytes = libc::off_t::try_from(stop - start).map_err(|_| invalid())?;
+                // Cold RAM has a per-VM shmem backing, so release its pages too.
+                // Restored mappings are private and must preserve the lower image.
+                if unsafe {
+                    libc::fallocate(
+                        backing.file().as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        file_offset,
+                        bytes,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                region
+                    .bitmap()
+                    .mark_dirty(offset as usize, (stop - start) as usize);
+                continue;
+            }
+
             // SAFETY: the retained region owns this complete, validated page range.
             // Keep its HVA (and KVM slot) fixed. MAP_FIXED replaces only these pages;
             // the region still unmaps the entire owned span when its last Arc drops.
@@ -1103,6 +1147,13 @@ impl AddressSpaceMgr {
         let mut regions = Vec::new();
         for region in memory.iter() {
             let guest_addr = region.start_addr().raw_value();
+            if self
+                .address_space
+                .as_ref()
+                .is_some_and(|space| space.is_dax_region(region.start_addr()))
+            {
+                continue;
+            }
             let kvm_slot = *slots
                 .get(&guest_addr)
                 .ok_or(AddressManagerError::InvalidOperation)?;
@@ -1223,6 +1274,14 @@ impl AddressSpaceMgr {
         let mut image_offset = 0;
         let mut buffer = vec![0u8; 1024 * 1024];
         for region in memory.iter() {
+            if !map
+                .regions
+                .iter()
+                .any(|saved| saved.guest_base == region.start_addr().raw_value())
+            {
+                continue;
+            }
+
             let size = region.len();
             let mut ranges = match region.file_offset() {
                 Some(backing) => {
@@ -1652,7 +1711,10 @@ mod tests {
         for region in memory.iter() {
             region.deref().bitmap().reset();
         }
-        let owner = PrivateMemoryReclaimer::new(first.vm_as.clone().unwrap());
+        let owner = PrivateMemoryReclaimer::new(
+            first.vm_as.clone().unwrap(),
+            first.address_space.clone().unwrap(),
+        );
         // mincore proves private resident pages are actually released, before any read faults.
         let resident = || {
             let mut pages = vec![0u8; 256];

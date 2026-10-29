@@ -203,6 +203,16 @@ impl Vm {
 
     fn validate_state_output(&self, file: &File) -> std::result::Result<(), SnapshotError> {
         use vm_memory::GuestMemory;
+        #[cfg(feature = "virtio-pmem")]
+        if self
+            .device_manager
+            .pmem_manager
+            .output_aliases_backing(file)?
+        {
+            return Err(SnapshotError::InvalidSnapshot(
+                "output aliases live pmem backing".into(),
+            ));
+        }
         if let Some(source) = &self.capture_source {
             if same_file(file, &source.state)? || same_file(file, &source.memory)? {
                 return Err(SnapshotError::InvalidSnapshot(
@@ -460,6 +470,13 @@ impl Vm {
                 .restore_slot_binding(binding)
                 .map_err(|e| CaptureError::Rejected(e.to_string()))?;
         }
+        #[cfg(feature = "virtio-pmem")]
+        for binding in &files.pmem_bindings {
+            self.device_manager
+                .pmem_manager
+                .bind_restore(binding)
+                .map_err(|e| CaptureError::Rejected(e.to_string()))?;
+        }
         self.device_manager
             .validate_capture_profile()
             .map_err(|e| CaptureError::Rejected(e.to_string()))?;
@@ -583,6 +600,7 @@ impl Vm {
                 name != "block"
                     && name != "virtio_net"
                     && !(cfg!(feature = "virtio-balloon") && name == "balloon")
+                    && !(cfg!(feature = "virtio-pmem") && name == "pmem")
                     && !(cfg!(feature = "virtio-fs") && name == "fs")
                     && !(cfg!(feature = "virtio-vsock") && name == "vsock")
                     && !value.is_null()
@@ -787,6 +805,10 @@ impl Vm {
                 ));
             }
         }
+        #[cfg(feature = "virtio-pmem")]
+        self.device_manager
+            .pmem_manager
+            .validate_snapshot(&state.device_states.pmem.clone().unwrap_or_default())?;
         let requirements = state.capture_cpu.as_ref().ok_or_else(|| {
             SnapshotError::InvalidSnapshot("legacy snapshot lacks held CPU requirements".into())
         })?;
@@ -885,6 +907,10 @@ impl Vm {
             .map_err(SnapshotError::Kvm)?;
         // KVM validates CPUID/MSR/XSAVE before any device is activated or CPU thread runs.
         self.vcpu_manager()?.restore_state(&state.vcpu_states, ())?;
+        #[cfg(feature = "virtio-pmem")]
+        if let Some(pmem) = &state.device_states.pmem {
+            self.device_manager.pmem_manager.restore_state(pmem, ())?;
+        }
         if let Some(block) = &state.device_states.block {
             self.device_manager.block_manager.restore_state(block, ())?;
         }
@@ -1104,6 +1130,164 @@ mod tests {
             .finalize_restore()
             .unwrap());
         target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+    }
+
+    #[cfg(feature = "virtio-pmem")]
+    fn configure_pmem(vm: &mut Vm, path: &std::path::Path) {
+        use crate::config_manager::DeviceConfigInfo;
+        use crate::device_manager::pmem_dev_mgr::PmemDeviceConfigInfo;
+        vm.device_manager
+            .pmem_manager
+            .info_list
+            .push(DeviceConfigInfo::new(PmemDeviceConfigInfo {
+                id: "guest-image".into(),
+                path: path.to_str().unwrap().into(),
+                read_only: true,
+                use_shared_irq: Some(false),
+                use_generic_irq: Some(false),
+                ..Default::default()
+            }));
+    }
+
+    #[cfg(feature = "virtio-pmem")]
+    #[test]
+    fn held_pmem_restore_keeps_image_outside_ram() {
+        use crate::device_manager::{DbsMmioV2Device, DeviceOpContext};
+        use dbs_virtio_devices::persist::VirtioQueueState;
+        let image = TempFile::new().unwrap();
+        image.as_file().set_len(2 << 20).unwrap();
+        image
+            .as_file()
+            .write_all_at(b"immutable-system-image", 0)
+            .unwrap();
+        let image_metadata = image.as_file().metadata().unwrap();
+        let (mut source, _real) = paused_counter_vm();
+        configure_pmem(&mut source, image.as_path());
+        let mut context = DeviceOpContext::new(
+            Some(source.epoll_manager.clone()),
+            &source.device_manager,
+            source.vm_as().cloned(),
+            source.vm_address_space().cloned(),
+            false,
+            Some(source.vm_config.clone()),
+            source.shared_info.clone(),
+        );
+        source
+            .device_manager
+            .pmem_manager
+            .attach_devices(&mut context)
+            .unwrap();
+        let device = source.device_manager.pmem_manager.info_list[0]
+            .device
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mmio = device.as_any().downcast_ref::<DbsMmioV2Device>().unwrap();
+        mmio.state().get_inner_device_mut().set_acked_features(1, 1);
+        let mut transport = mmio.save_state();
+        transport.queues[0].queue = VirtioQueueState {
+            max_size: 256,
+            size: 16,
+            ready: true,
+            next_avail: 0,
+            next_used: 0,
+            desc_table: 0x4000,
+            avail_ring: 0x4200,
+            used_ring: 0x4300,
+            ..Default::default()
+        };
+        transport.driver_status = 0xf;
+        transport.device_activated = true;
+        mmio.restore_state(&transport).unwrap();
+        let config = source.vm_config.clone();
+        let state_file = TempFile::new().unwrap();
+        let ram_file = TempFile::new().unwrap();
+        let input = files(&state_file, &ram_file);
+        let report = source.begin_capture(1, deadline()).unwrap();
+        assert_eq!(report.memory_layout.total_bytes, 16 << 20);
+        assert_eq!(report.device_acks[0].device_id, "pmem:guest-image");
+        assert!(source
+            .export_held_snapshot(
+                1,
+                deadline(),
+                &SnapshotFiles::new(
+                    image.as_file().try_clone().unwrap(),
+                    input.memory.try_clone().unwrap()
+                )
+            )
+            .is_err());
+        source.export_held_snapshot(1, deadline(), &input).unwrap();
+        assert_eq!(input.memory.metadata().unwrap().len(), 16 << 20);
+        source.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        drop(source);
+        for index in 0..3 {
+            let epoll = EpollManager::default();
+            let vmm = Arc::new(Mutex::new(crate::vmm::tests::create_vmm_instance(
+                epoll.clone(),
+            )));
+            let mut events = EventManager::new(&vmm, epoll.clone()).unwrap();
+            let mut vmm = vmm.lock().unwrap();
+            let target = vmm.get_vm_mut().unwrap();
+            let _real = RealVcpuExecution::new(target.vm_fd.clone());
+            target.set_vm_config(config.clone());
+            // Rebind the same inode through a different path, as the runner does with FDs.
+            let replacement = TempFile::new().unwrap();
+            std::fs::copy(image.as_path(), replacement.as_path()).unwrap();
+            let mut input = files(&state_file, &ram_file);
+            let alias = if index == 1 {
+                let live = replacement.as_file().metadata().unwrap();
+                input
+                    .pmem_bindings
+                    .push(crate::device_manager::pmem_dev_mgr::RestorePmemBinding {
+                        id: "guest-image".into(),
+                        saved_backing: (
+                            image_metadata.dev(),
+                            image_metadata.ino(),
+                            image_metadata.len(),
+                        ),
+                        current_backing: (live.dev(), live.ino(), live.len()),
+                    });
+                replacement.as_file().try_clone().unwrap()
+            } else {
+                image.as_file().try_clone().unwrap()
+            };
+            let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", alias.as_raw_fd()));
+            configure_pmem(target, &path);
+            target
+                .load_snapshot_held(&mut events, Default::default(), &input, 1, deadline())
+                .unwrap();
+            let device = target.device_manager.pmem_manager.info_list[0]
+                .device
+                .as_ref()
+                .unwrap();
+            let restored = device
+                .as_any()
+                .downcast_ref::<DbsMmioV2Device>()
+                .unwrap()
+                .save_state();
+            assert_eq!(restored.queues, transport.queues);
+            assert!(restored.device_activated);
+            assert_eq!(
+                target.address_space.capture_layout().unwrap().total_bytes,
+                16 << 20
+            );
+            target.end_capture(1, deadline(), false).unwrap();
+            target.begin_capture(2, deadline()).unwrap();
+            let next_state = TempFile::new().unwrap();
+            let next_ram = TempFile::new().unwrap();
+            target
+                .export_held_snapshot(2, deadline(), &files(&next_state, &next_ram))
+                .unwrap();
+            assert_eq!(next_ram.as_file().metadata().unwrap().len(), 16 << 20);
+            target.vcpu_manager().unwrap().exit_all_vcpus().unwrap();
+        }
+        assert_eq!(
+            image.as_file().metadata().unwrap().blocks(),
+            image_metadata.blocks()
+        );
+        let mut marker = [0; 22];
+        image.as_file().read_exact_at(&mut marker, 0).unwrap();
+        assert_eq!(&marker, b"immutable-system-image");
     }
 
     #[cfg(feature = "virtio-balloon")]
@@ -1438,9 +1622,19 @@ mod tests {
             },
             0
         );
-        let reclaimer = PrivateMemoryReclaimer::new(vm.vm_as().cloned().unwrap());
+        let reclaimer = PrivateMemoryReclaimer::new(
+            vm.vm_as().cloned().unwrap(),
+            vm.address_space.address_space().cloned().unwrap(),
+        );
+        ram.write_slice(&[0xa5; 8192], GuestAddress(0x6000))
+            .unwrap();
+        let allocated = backing.metadata().unwrap().blocks();
         reclaimer.reclaim_private_range(0x6000, 8192).unwrap();
-        // The real CPU writes the first anonymous page through the original slot.
+        assert!(
+            backing.metadata().unwrap().blocks() < allocated,
+            "cold reporting must release shmem blocks"
+        );
+        // The real CPU writes the reclaimed page through the original slot.
         ram.write_slice(&[0xff, 0x06, 0x00, 0x60, 0xeb, 0xfa], GuestAddress(0x1000))
             .unwrap();
         vm.begin_capture(1, deadline()).unwrap();
