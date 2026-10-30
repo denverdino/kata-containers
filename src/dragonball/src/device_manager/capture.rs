@@ -536,16 +536,14 @@ mod tests {
     use crate::device_manager::DeviceOpContext;
     use std::time::Duration;
 
-    #[cfg(not(feature = "atomic-guest-memory"))]
     static NEXT_TAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
-    #[cfg(not(feature = "atomic-guest-memory"))]
     fn active_net(
         manager: &mut DeviceManager,
         epoll: &dbs_utils::epoll_manager::EpollManager,
         id: &str,
     ) -> (
-        crate::address_space_manager::GuestAddressSpaceImpl,
+        crate::address_space_manager::GuestMemoryImpl,
         Arc<vmm_sys_util::eventfd::EventFd>,
         Arc<dyn DeviceIo>,
     ) {
@@ -556,9 +554,18 @@ mod tests {
         use dbs_utils::net::Tap;
         use dbs_virtio_devices::{VirtioDevice, VirtioDeviceConfig, VirtioQueueConfig};
         use virtio_queue::{QueueSync, QueueT};
-        use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+        use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryMmap};
 
-        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+        let ram = GuestMemoryMmap::<vm_memory::bitmap::AtomicBitmap>::from_ranges(&[(
+            GuestAddress(0),
+            0x10000,
+        )])
+        .unwrap();
+        #[cfg(feature = "atomic-guest-memory")]
+        let mem = vm_memory::GuestMemoryAtomic::new(ram);
+        #[cfg(not(feature = "atomic-guest-memory"))]
+        let mem = Arc::new(ram);
+        let memory = (*mem.memory()).clone();
         let address_space = super::super::tests::create_address_space();
         let mut queues = Vec::new();
         for index in 0..2 {
@@ -576,9 +583,9 @@ mod tests {
             queues.push(queue);
         }
         // One saved TX descriptor. RX has no available buffers.
-        mem.write_obj(0x3000u64, GuestAddress(0x2000)).unwrap();
-        mem.write_obj(64u32, GuestAddress(0x2008)).unwrap();
-        mem.write_obj(1u16, GuestAddress(0x2202)).unwrap();
+        memory.write_obj(0x3000u64, GuestAddress(0x2000)).unwrap();
+        memory.write_obj(64u32, GuestAddress(0x2008)).unwrap();
+        memory.write_obj(1u16, GuestAddress(0x2202)).unwrap();
         let tx_event = queues[1].eventfd.clone();
         let config = VirtioDeviceConfig::<GuestAddressSpaceImpl>::new(
             mem.clone(),
@@ -634,10 +641,9 @@ mod tests {
                 config,
                 Some(device.clone()),
             ));
-        (mem, tx_event, device)
+        (memory, tx_event, device)
     }
 
-    #[cfg(not(feature = "atomic-guest-memory"))]
     #[test]
     fn capture_manager_controls_real_activated_devices() {
         use vm_memory::{Bytes, GuestAddress};
@@ -667,7 +673,6 @@ mod tests {
         assert_eq!(mem1.read_obj::<u16>(GuestAddress(0x2302)).unwrap(), 1);
     }
 
-    #[cfg(not(feature = "atomic-guest-memory"))]
     #[test]
     fn capture_release_cannot_forget_previously_held_devices() {
         use vm_memory::{Bytes, GuestAddress};
@@ -690,7 +695,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "atomic-guest-memory"))]
     #[test]
     fn capture_partial_ack_requires_confirmed_release_or_teardown() {
         use vm_memory::{Bytes, GuestAddress};
@@ -726,7 +730,6 @@ mod tests {
         drop(epoll);
     }
 
-    #[cfg(not(feature = "atomic-guest-memory"))]
     #[test]
     #[cfg(feature = "virtio-rng")]
     fn capture_rejects_rng_before_holding_active_net() {
@@ -753,7 +756,6 @@ mod tests {
         assert_eq!(mem.read_obj::<u16>(GuestAddress(0x2302)).unwrap(), 1);
     }
 
-    #[cfg(not(feature = "atomic-guest-memory"))]
     #[test]
     fn capture_transport_lock_obeys_deadline_before_any_hold() {
         let epoll = dbs_utils::epoll_manager::EpollManager::default();
