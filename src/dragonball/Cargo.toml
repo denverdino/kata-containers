@@ -60,6 +60,7 @@ tdx = { workspace = true }
 [dev-dependencies]
 serial_test = { workspace = true }
 slog-async = { workspace = true }
+slog-stdlog = { workspace = true }
 slog-term = { workspace = true }
 test-utils = { workspace = true }
 

@@ -8,6 +8,9 @@ use std::time::Instant;
 
 use vmm_sys_util::eventfd::EventFd;
 
+#[cfg(test)]
+mod tests;
+
 /// A nonzero, monotonically increasing capture generation within one VM.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureGeneration(pub u64);

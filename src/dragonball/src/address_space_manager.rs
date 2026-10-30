@@ -1184,14 +1184,18 @@ impl AddressSpaceMgr {
         vmfd: &VmFd,
         generation: u64,
         classify_zeros: bool,
+        deadline: std::time::Instant,
     ) -> Result<crate::memory_tracking::FrozenMemoryMap> {
         use crate::memory_tracking::{push_page, FrozenMemoryMap, FrozenMemoryRegion};
+        use crate::snapshot::capture::check_deadline;
         use vm_memory::Bytes;
+        check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
         if !self.dirty_logging || unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != 4096 {
             return Err(AddressManagerError::InvalidOperation);
         }
         let layout = self.capture_layout()?;
         for region in &layout.regions {
+            check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
             let bitmap = vmfd
                 .get_dirty_log(region.kvm_slot, region.size as usize)
                 .map_err(|e| {
@@ -1201,6 +1205,7 @@ impl AddressSpaceMgr {
             // even if a later slot, page read or output operation fails.
             self.memory_tracker
                 .merge(region.file_offset, region.size, &bitmap);
+            check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
         }
         let memory = self
             .vm_memory()
@@ -1225,6 +1230,9 @@ impl AddressSpaceMgr {
                 .ok_or(AddressManagerError::InvalidOperation)?
                 .bitmap();
             for offset in (0..region.size).step_by(4096) {
+                if offset % (4 << 20) == 0 {
+                    check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
+                }
                 let image_offset = region.file_offset + offset;
                 if software.dirty_at(offset as usize) {
                     self.memory_tracker.mark_page(image_offset);
@@ -1257,10 +1265,13 @@ impl AddressSpaceMgr {
         vmfd: &VmFd,
         generation: u64,
         file: &File,
+        deadline: std::time::Instant,
     ) -> Result<GuestMemoryState> {
+        use crate::snapshot::capture::check_deadline;
         use std::convert::TryFrom;
         use std::os::unix::fs::FileExt;
         use std::time::{Duration, Instant};
+        check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
 
         // Legacy MAP_FIXED restore cannot prove the live backing for alias checks.
         if !self.memory_file_offsets_valid {
@@ -1268,7 +1279,7 @@ impl AddressSpaceMgr {
         }
         // This internal read does not acquire or release a caller's read-map pin.
         let started = Instant::now();
-        let map = self.frozen_memory_map(vmfd, generation, false)?;
+        let map = self.frozen_memory_map(vmfd, generation, false, deadline)?;
         let bitmap_time = started.elapsed();
         let mut ranges_time = Duration::ZERO;
         let mut copy_time = Duration::ZERO;
@@ -1286,6 +1297,7 @@ impl AddressSpaceMgr {
         let memory = self
             .vm_memory()
             .ok_or(AddressManagerError::GuestMemoryNotInitialized)?;
+        check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
         file.set_len(0).map_err(AddressManagerError::SnapshotFile)?;
         let mut regions = Vec::new();
         let mut image_offset = 0;
@@ -1334,6 +1346,9 @@ impl AddressSpaceMgr {
                 // Software marks also cover anonymous balloon replacements.
                 let mut software_ranges = Vec::new();
                 for offset in (0..size).step_by(4096) {
+                    if offset % (4 << 20) == 0 {
+                        check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
+                    }
                     if region.bitmap().dirty_at(offset as usize) {
                         crate::memory_tracking::push_page(
                             &mut software_ranges,
@@ -1346,12 +1361,14 @@ impl AddressSpaceMgr {
                     start..start + range.length
                 }));
             }
+            check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
             ranges.sort_unstable_by_key(|range| range.start);
             ranges_time += range_started.elapsed();
             let mut cursor = 0;
             for range in ranges {
                 let mut start = range.start.max(cursor);
                 while start < range.end {
+                    check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
                     let length = (range.end - start).min(buffer.len() as u64) as usize;
                     let bytes = &mut buffer[..length];
                     let copy_started = Instant::now();
@@ -1444,6 +1461,7 @@ impl AddressSpaceMgr {
             });
             image_offset += size;
         }
+        check_deadline(deadline).map_err(AddressManagerError::SnapshotFile)?;
         file.set_len(image_offset)
             .map_err(AddressManagerError::SnapshotFile)?;
         info!(
@@ -2149,7 +2167,12 @@ mod tests {
             )
             .unwrap();
         assert!(memory
-            .frozen_memory_map(&vm, 1, true)
+            .frozen_memory_map(
+                &vm,
+                1,
+                true,
+                std::time::Instant::now() + std::time::Duration::from_secs(3)
+            )
             .unwrap()
             .changed_ranges
             .is_empty());
@@ -2210,7 +2233,14 @@ mod tests {
             .insert(4u64 << 30, u32::MAX)
             .unwrap();
         assert!(
-            memory.frozen_memory_map(&vm, 2, true).is_err(),
+            memory
+                .frozen_memory_map(
+                    &vm,
+                    2,
+                    true,
+                    std::time::Instant::now() + std::time::Duration::from_secs(3)
+                )
+                .is_err(),
             "later slot failure must not discard the already-read low bitmap"
         );
         memory
@@ -2218,7 +2248,14 @@ mod tests {
             .lock()
             .unwrap()
             .insert(4u64 << 30, high_slot);
-        let first = memory.frozen_memory_map(&vm, 2, true).unwrap();
+        let first = memory
+            .frozen_memory_map(
+                &vm,
+                2,
+                true,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            )
+            .unwrap();
         let contains = |ranges: &[crate::memory_tracking::MemoryRange], offset| {
             ranges.iter().any(|range| {
                 range.image_offset <= offset && range.image_offset + range.length > offset
@@ -2236,15 +2273,36 @@ mod tests {
         );
         ram.write_obj(0u8, GuestAddress((4u64 << 30) + 0x2000))
             .unwrap();
-        let unclassified = memory.frozen_memory_map(&vm, 3, false).unwrap();
+        let unclassified = memory
+            .frozen_memory_map(
+                &vm,
+                3,
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            )
+            .unwrap();
         assert_eq!(unclassified.changed_ranges, first.changed_ranges);
         assert!(unclassified.zero_ranges.is_empty());
-        let zero = memory.frozen_memory_map(&vm, 3, true).unwrap();
+        let zero = memory
+            .frozen_memory_map(
+                &vm,
+                3,
+                true,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            )
+            .unwrap();
         assert_eq!(zero.changed_ranges, first.changed_ranges);
         assert!(contains(&zero.zero_ranges, (3u64 << 30) + 0x2000));
         ram.write_obj(0x91u8, GuestAddress((4u64 << 30) + 0x2000))
             .unwrap();
-        let rewritten = memory.frozen_memory_map(&vm, 4, true).unwrap();
+        let rewritten = memory
+            .frozen_memory_map(
+                &vm,
+                4,
+                true,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            )
+            .unwrap();
         assert!(!contains(&rewritten.zero_ranges, (3u64 << 30) + 0x2000));
         let mut lower = [0];
         file.read_exact_at(&mut lower, (3u64 << 30) + 0x2000)
@@ -2278,7 +2336,14 @@ mod tests {
         ram.write_obj(1u8, GuestAddress(4095)).unwrap();
         ram.write_obj(1u8, GuestAddress((9u64 << 30) - 1)).unwrap();
         let started = std::time::Instant::now();
-        let map = memory.frozen_memory_map(&vm, 1, true).unwrap();
+        let map = memory
+            .frozen_memory_map(
+                &vm,
+                1,
+                true,
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+            )
+            .unwrap();
         let elapsed = started.elapsed();
         eprintln!("8 GiB cold memory-map export: {elapsed:?}");
         assert_eq!(map.regions.len(), 2);

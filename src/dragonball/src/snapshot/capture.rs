@@ -7,6 +7,20 @@ use dbs_virtio_devices::capture::WorkerAck;
 use serde_derive::{Deserialize, Serialize};
 use std::fs::File;
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Maximum metadata size for held snapshots, independent of guest RAM size.
+pub const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub(crate) fn check_deadline(deadline: Instant) -> std::io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "snapshot operation deadline expired",
+        ));
+    }
+    Ok(())
+}
 
 /// Owned state output handle, compared by ownership identity like SnapshotFiles.
 #[derive(Clone, Debug)]
