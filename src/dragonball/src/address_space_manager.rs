@@ -1258,14 +1258,31 @@ impl AddressSpaceMgr {
         generation: u64,
         file: &File,
     ) -> Result<GuestMemoryState> {
+        use std::convert::TryFrom;
         use std::os::unix::fs::FileExt;
+        use std::time::{Duration, Instant};
 
         // Legacy MAP_FIXED restore cannot prove the live backing for alias checks.
         if !self.memory_file_offsets_valid {
             return Err(AddressManagerError::InvalidOperation);
         }
         // This internal read does not acquire or release a caller's read-map pin.
+        let started = Instant::now();
         let map = self.frozen_memory_map(vmfd, generation, false)?;
+        let bitmap_time = started.elapsed();
+        let mut ranges_time = Duration::ZERO;
+        let mut copy_time = Duration::ZERO;
+        let mut zero_time = Duration::ZERO;
+        let mut write_time = Duration::ZERO;
+        let mut writeback_time = Duration::ZERO;
+        let mut writeback_from = 0u64;
+        let mut writeback_bytes = 0u64;
+        let mut writeback_calls = 0u64;
+        let mut writeback_supported = true;
+        let mut copied_bytes = 0u64;
+        let mut written_bytes = 0u64;
+        let mut write_calls = 0u64;
+        let mut zero_pages = 0u64;
         let memory = self
             .vm_memory()
             .ok_or(AddressManagerError::GuestMemoryNotInitialized)?;
@@ -1282,6 +1299,7 @@ impl AddressSpaceMgr {
                 continue;
             }
 
+            let range_started = Instant::now();
             let size = region.len();
             let mut ranges = match region.file_offset() {
                 Some(backing) => {
@@ -1329,12 +1347,14 @@ impl AddressSpaceMgr {
                 }));
             }
             ranges.sort_unstable_by_key(|range| range.start);
+            ranges_time += range_started.elapsed();
             let mut cursor = 0;
             for range in ranges {
                 let mut start = range.start.max(cursor);
                 while start < range.end {
                     let length = (range.end - start).min(buffer.len() as u64) as usize;
                     let bytes = &mut buffer[..length];
+                    let copy_started = Instant::now();
                     region
                         .read_slice(bytes, MemoryRegionAddress(start))
                         .map_err(|error| {
@@ -1343,22 +1363,75 @@ impl AddressSpaceMgr {
                                 error,
                             )
                         })?;
+                    copy_time += copy_started.elapsed();
+                    copied_bytes += length as u64;
                     // Coalesce nonzero pages into writes, leaving zero pages as holes.
+                    let zero_started = Instant::now();
+                    let prior_write_time = write_time;
                     let mut run = None;
                     for (index, page) in bytes.chunks(4096).enumerate() {
                         if page.iter().any(|byte| *byte != 0) {
                             run.get_or_insert(index * 4096);
-                        } else if let Some(first) = run.take() {
-                            file.write_all_at(
-                                &bytes[first..index * 4096],
-                                image_offset + start + first as u64,
-                            )
-                            .map_err(AddressManagerError::SnapshotFile)?;
+                        } else {
+                            zero_pages += 1;
+                            if let Some(first) = run.take() {
+                                let write_started = Instant::now();
+                                file.write_all_at(
+                                    &bytes[first..index * 4096],
+                                    image_offset + start + first as u64,
+                                )
+                                .map_err(AddressManagerError::SnapshotFile)?;
+                                write_time += write_started.elapsed();
+                                written_bytes += (index * 4096 - first) as u64;
+                                write_calls += 1;
+                            }
                         }
                     }
                     if let Some(first) = run {
+                        let write_started = Instant::now();
                         file.write_all_at(&bytes[first..], image_offset + start + first as u64)
                             .map_err(AddressManagerError::SnapshotFile)?;
+                        write_time += write_started.elapsed();
+                        written_bytes += (bytes.len() - first) as u64;
+                        write_calls += 1;
+                    }
+                    zero_time += zero_started
+                        .elapsed()
+                        .saturating_sub(write_time - prior_write_time);
+                    if writeback_supported && written_bytes - writeback_bytes >= 4 * 1024 * 1024 {
+                        let writeback_started = Instant::now();
+                        let end = image_offset + start + length as u64;
+                        let offset = i64::try_from(writeback_from)
+                            .map_err(|_| AddressManagerError::InvalidOperation)?;
+                        let length = i64::try_from(end - writeback_from)
+                            .map_err(|_| AddressManagerError::InvalidOperation)?;
+                        // Queue data writeback while later RAM ranges are copied.
+                        // SAFETY: file is an owned regular output and the range
+                        // covers only its packed snapshot offsets. The final
+                        // memory/state fsync remains the durability boundary.
+                        let result = unsafe {
+                            libc::sync_file_range(
+                                file.as_raw_fd(),
+                                offset,
+                                length,
+                                libc::SYNC_FILE_RANGE_WRITE,
+                            )
+                        };
+                        if result != 0 {
+                            let error = std::io::Error::last_os_error();
+                            match error.raw_os_error() {
+                                Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => {
+                                    warn!("Snapshot writeback is unavailable; final fsync remains required: {error}");
+                                    writeback_supported = false;
+                                }
+                                _ => return Err(AddressManagerError::SnapshotFile(error)),
+                            }
+                        } else {
+                            writeback_calls += 1;
+                        }
+                        writeback_from = end;
+                        writeback_bytes = written_bytes;
+                        writeback_time += writeback_started.elapsed();
                     }
                     start += length as u64;
                 }
@@ -1373,6 +1446,12 @@ impl AddressSpaceMgr {
         }
         file.set_len(image_offset)
             .map_err(AddressManagerError::SnapshotFile)?;
+        info!(
+            "Held RAM export phases: generation={} bitmap_us={} ranges_us={} copy_us={} zero_us={} write_us={} writeback_us={} total_us={} copied_bytes={} written_bytes={} write_calls={} zero_pages={} writeback_calls={} writeback_supported={}",
+            generation, bitmap_time.as_micros(), ranges_time.as_micros(), copy_time.as_micros(),
+            zero_time.as_micros(), write_time.as_micros(), writeback_time.as_micros(), started.elapsed().as_micros(),
+            copied_bytes, written_bytes, write_calls, zero_pages, writeback_calls, writeback_supported
+        );
         Ok(GuestMemoryState { regions })
     }
 

@@ -419,12 +419,17 @@ impl Vm {
             for output in [&files.state, &files.memory] {
                 self.validate_state_output(output)?;
             }
+            let started = Instant::now();
             let mut state = self.held_snapshot_metadata(&expected, deadline)?;
+            let metadata_time = started.elapsed();
+            let memory_started = Instant::now();
             state.memory_state = Some(self.address_space.save_held_memory(
                 &self.vm_fd,
                 generation,
                 &files.memory,
             )?);
+            let memory_time = memory_started.elapsed();
+            let state_started = Instant::now();
             let mut output = files.state.try_clone()?;
             output.seek(SeekFrom::Start(0))?;
             output.set_len(0)?;
@@ -432,8 +437,17 @@ impl Vm {
             serde_json::to_writer(&mut writer, &state)
                 .map_err(crate::snapshot::PersistError::from)?;
             writer.flush()?;
+            let state_time = state_started.elapsed();
+            let sync_started = Instant::now();
             files.memory.sync_all()?;
             files.state.sync_all()?;
+            info!(self.logger, "Held snapshot export phases";
+                "generation" => generation,
+                "metadata_us" => metadata_time.as_micros() as u64,
+                "memory_us" => memory_time.as_micros() as u64,
+                "state_us" => state_time.as_micros() as u64,
+                "sync_us" => sync_started.elapsed().as_micros() as u64,
+                "total_us" => started.elapsed().as_micros() as u64);
             if Instant::now() >= deadline {
                 return Err(SnapshotError::InvalidState(
                     "export deadline expired; session remains held".into(),
@@ -1535,6 +1549,9 @@ mod tests {
     fn held_snapshot_preserves_cold_memory_sparsity() {
         let (mut vm, real) = paused_counter_vm();
         let ram = vm.address_space.vm_memory().unwrap();
+        // Preserve a populated run alongside untouched RAM and a zero tail.
+        let payload = vec![0x5a; 4 << 20];
+        ram.write_slice(&payload, GuestAddress(4 << 20)).unwrap();
         vm.begin_capture(1, deadline()).unwrap();
         vm.end_capture(1, deadline(), true).unwrap();
         let limit = deadline();
@@ -1599,6 +1616,12 @@ mod tests {
         let mut saved = [0; 2];
         memory.as_file().read_exact_at(&mut saved, 0x2000).unwrap();
         assert_eq!(u16::from_le_bytes(saved), counter);
+        let mut copied = vec![0; payload.len()];
+        memory
+            .as_file()
+            .read_exact_at(&mut copied, 4 << 20)
+            .unwrap();
+        assert_eq!(copied, payload);
         let mut tail = [1; 4096];
         memory
             .as_file()
