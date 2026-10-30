@@ -7,6 +7,13 @@ use std::ops::Deref;
 
 #[cfg(all(target_arch = "x86_64", feature = "virtio-blk", feature = "virtio-net"))]
 mod capture;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    feature = "virtio-blk",
+    feature = "virtio-net"
+))]
+mod export_io_diagnostic;
 #[cfg(target_arch = "x86_64")]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;

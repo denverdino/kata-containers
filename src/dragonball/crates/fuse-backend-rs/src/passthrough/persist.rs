@@ -467,6 +467,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
 #[cfg(test)]
 mod tests {
+    mod hardening;
+
     use super::super::{Config, PassthroughFs};
     use crate::api::filesystem::{Context, FileSystem, FsOptions, ZeroCopyWriter};
     use crate::file_buf::FileVolatileSlice;

@@ -39,6 +39,7 @@ members = [
   "src/dragonball/crates/dbs_upcall",
   "src/dragonball/crates/dbs_utils",
   "src/dragonball/crates/dbs_virtio_devices",
+  "src/dragonball/crates/fuse-backend-rs",
 
   # tools
   "src/tools/agent-ctl",
@@ -65,7 +66,6 @@ resolver = "2"
 
 # TODO: Add all excluded crates to root workspace
 exclude = [
-  "src/dragonball/crates/fuse-backend-rs",
   "src/tools",
 
   # We are cloning and building rust packages under

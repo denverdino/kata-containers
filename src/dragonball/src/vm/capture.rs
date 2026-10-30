@@ -3,12 +3,14 @@
 
 use super::*;
 use crate::device_manager::capture::DeviceCaptureError;
-use crate::snapshot::capture::{CaptureError, CaptureReport, CpuRequirements, SnapshotFiles};
+use crate::snapshot::capture::{
+    check_deadline, CaptureError, CaptureReport, CpuRequirements, SnapshotFiles, MAX_STATE_BYTES,
+};
 use crate::snapshot::{MicrovmState, SnapshotError};
 use dbs_snapshot::Persist;
 use dbs_virtio_devices::capture::CaptureGeneration;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::sync::{MutexGuard, TryLockError};
@@ -26,6 +28,32 @@ pub(super) struct VmCaptureSession {
 
 fn terminal(error: impl std::fmt::Display) -> CaptureError {
     CaptureError::Terminal(error.to_string())
+}
+
+struct StateWriter<W> {
+    output: W,
+    remaining: u64,
+    deadline: Instant,
+}
+
+impl<W: Write> Write for StateWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        check_deadline(self.deadline)?;
+        if bytes.len() as u64 > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "held snapshot state exceeds 64 MiB",
+            ));
+        }
+        let written = self.output.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        check_deadline(self.deadline)?;
+        self.output.flush()
+    }
 }
 
 fn same_file(left: &File, right: &File) -> std::io::Result<bool> {
@@ -102,7 +130,7 @@ impl Vm {
         }
         let map = self
             .address_space
-            .frozen_memory_map(&self.vm_fd, generation, classify_zeros)
+            .frozen_memory_map(&self.vm_fd, generation, classify_zeros, deadline)
             .map_err(|e| CaptureError::Export(e.into()))?;
         if Instant::now() >= deadline {
             return Err(CaptureError::Rejected(
@@ -419,21 +447,48 @@ impl Vm {
             for output in [&files.state, &files.memory] {
                 self.validate_state_output(output)?;
             }
+            let started = Instant::now();
             let mut state = self.held_snapshot_metadata(&expected, deadline)?;
+            let metadata_time = started.elapsed();
+            let memory_started = Instant::now();
             state.memory_state = Some(self.address_space.save_held_memory(
                 &self.vm_fd,
                 generation,
                 &files.memory,
+                deadline,
             )?);
+            let memory_time = memory_started.elapsed();
+            check_deadline(deadline)?;
+            let state_started = Instant::now();
             let mut output = files.state.try_clone()?;
             output.seek(SeekFrom::Start(0))?;
             output.set_len(0)?;
-            let mut writer = BufWriter::new(output);
+            let mut writer = BufWriter::new(StateWriter {
+                output,
+                remaining: MAX_STATE_BYTES,
+                deadline,
+            });
             serde_json::to_writer(&mut writer, &state)
                 .map_err(crate::snapshot::PersistError::from)?;
             writer.flush()?;
+            let state_time = state_started.elapsed();
+            let sync_started = Instant::now();
+            check_deadline(deadline)?;
             files.memory.sync_all()?;
+            let memory_sync_time = sync_started.elapsed();
+            check_deadline(deadline)?;
+            let state_sync_started = Instant::now();
             files.state.sync_all()?;
+            let state_sync_time = state_sync_started.elapsed();
+            info!(self.logger, "Held snapshot export phases";
+                "generation" => generation,
+                "metadata_us" => metadata_time.as_micros() as u64,
+                "memory_us" => memory_time.as_micros() as u64,
+                "state_us" => state_time.as_micros() as u64,
+                "memory_sync_us" => memory_sync_time.as_micros() as u64,
+                "state_sync_us" => state_sync_time.as_micros() as u64,
+                "sync_us" => sync_started.elapsed().as_micros() as u64,
+                "total_us" => started.elapsed().as_micros() as u64);
             if Instant::now() >= deadline {
                 return Err(SnapshotError::InvalidState(
                     "export deadline expired; session remains held".into(),
@@ -482,6 +537,7 @@ impl Vm {
             .read_held_snapshot(files)
             .map_err(|e| CaptureError::Rejected(e.to_string()))?;
         let decoded_us = started.elapsed().as_micros() as u64;
+        check_deadline(deadline).map_err(|e| CaptureError::Rejected(e.to_string()))?;
         let (mut memory_us, mut vcpu_manager_us, mut devices_us, mut state_us, mut events_us) =
             (0u64, 0u64, 0u64, 0u64, 0u64);
         self.last_capture_generation = generation;
@@ -575,16 +631,28 @@ impl Vm {
         &self,
         files: &SnapshotFiles,
     ) -> std::result::Result<MicrovmState, SnapshotError> {
-        if !files.state.metadata()?.is_file() {
+        let metadata = files.state.metadata()?;
+        if !metadata.is_file() {
             return Err(SnapshotError::InvalidSnapshot(
                 "held snapshot state must be a regular file".into(),
+            ));
+        }
+        if metadata.len() > MAX_STATE_BYTES {
+            return Err(SnapshotError::InvalidSnapshot(
+                "held snapshot state exceeds 64 MiB".into(),
             ));
         }
         crate::address_space_manager::inspect_memory_backing(&files.memory)?;
         let mut file = files.state.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
-        let value: serde_json::Value = serde_json::from_reader(BufReader::new(file))
-            .map_err(crate::snapshot::PersistError::from)?;
+        let mut reader = BufReader::new(file.take(MAX_STATE_BYTES + 1));
+        let value: serde_json::Value =
+            serde_json::from_reader(&mut reader).map_err(crate::snapshot::PersistError::from)?;
+        if reader.get_ref().limit() == 0 {
+            return Err(SnapshotError::InvalidSnapshot(
+                "held snapshot state exceeds 64 MiB".into(),
+            ));
+        }
         crate::snapshot::check_epoch(
             value
                 .get("header")
@@ -940,7 +1008,9 @@ impl Vm {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    mod hardening;
+
     use super::*;
     use crate::snapshot::capture::SnapshotFiles;
     use crate::vcpu::RealVcpuExecution;
@@ -1535,6 +1605,9 @@ mod tests {
     fn held_snapshot_preserves_cold_memory_sparsity() {
         let (mut vm, real) = paused_counter_vm();
         let ram = vm.address_space.vm_memory().unwrap();
+        // Preserve a populated run alongside untouched RAM and a zero tail.
+        let payload = vec![0x5a; 4 << 20];
+        ram.write_slice(&payload, GuestAddress(4 << 20)).unwrap();
         vm.begin_capture(1, deadline()).unwrap();
         vm.end_capture(1, deadline(), true).unwrap();
         let limit = deadline();
@@ -1599,6 +1672,12 @@ mod tests {
         let mut saved = [0; 2];
         memory.as_file().read_exact_at(&mut saved, 0x2000).unwrap();
         assert_eq!(u16::from_le_bytes(saved), counter);
+        let mut copied = vec![0; payload.len()];
+        memory
+            .as_file()
+            .read_exact_at(&mut copied, 4 << 20)
+            .unwrap();
+        assert_eq!(copied, payload);
         let mut tail = [1; 4096];
         memory
             .as_file()
@@ -2289,7 +2368,7 @@ mod tests {
         paused_counter_vm_with_disk_slot(disk, false, 16)
     }
 
-    fn paused_counter_vm_with_disk_slot(
+    pub(in crate::vm) fn paused_counter_vm_with_disk_slot(
         disk: Option<&std::path::Path>,
         slot: bool,
         mem_size_mib: usize,
